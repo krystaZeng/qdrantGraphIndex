@@ -90,6 +90,10 @@ impl EdgeConfig {
             .filter_map(|v| match &v.index {
                 segment::types::Indexes::Plain {} => None,
                 segment::types::Indexes::Hnsw(h) => Some(*h),
+                // MIRAGE: use the HNSW-compatible view so global hnsw_config
+                // inference still works when all vectors agree on these
+                // baseline parameters.
+                segment::types::Indexes::Mirage(m) => Some(m.to_hnsw_compat()),
             })
             .collect();
         let hnsw_config = hnsw_configs

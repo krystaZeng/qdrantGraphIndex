@@ -340,6 +340,18 @@ pub(crate) fn open_vector_index(
             payload_index,
             hnsw_config: *hnsw_config,
         })?),
+        Indexes::Mirage(mirage_config) => VectorIndexEnum::Mirage(
+            crate::index::mirage_index::MirageIndex::open(
+                crate::index::mirage_index::MirageIndexOpenArgs {
+                    path,
+                    id_tracker,
+                    vector_storage,
+                    quantized_vectors,
+                    payload_index,
+                    mirage_config: *mirage_config,
+                },
+            )?,
+        ),
     })
 }
 
@@ -373,6 +385,19 @@ pub(crate) fn build_vector_index<R: Rng + ?Sized>(
             },
             build_args,
         )?),
+        Indexes::Mirage(mirage_config) => VectorIndexEnum::Mirage(
+            crate::index::mirage_index::MirageIndex::build(
+                crate::index::mirage_index::MirageIndexOpenArgs {
+                    path,
+                    id_tracker,
+                    vector_storage,
+                    quantized_vectors,
+                    payload_index,
+                    mirage_config: *mirage_config,
+                },
+                build_args,
+            )?,
+        ),
     })
 }
 

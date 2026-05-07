@@ -109,6 +109,9 @@ impl EdgeVectorParams {
             hnsw_config: match index {
                 Indexes::Plain {} => None,
                 Indexes::Hnsw(hnsw_config) => Some(*hnsw_config),
+                // MIRAGE has its own (richer) config; the HNSW-compatible
+                // fields are exposed via [`MirageConfig::to_hnsw_compat`].
+                Indexes::Mirage(mirage_config) => Some(mirage_config.to_hnsw_compat()),
             },
         }
     }

@@ -756,9 +756,12 @@ fn get_hnsw_ef_construct(config: &SegmentConfig, vector_name: &VectorName) -> Op
         .get(vector_name)
         .and_then(|config| match &config.index {
             Indexes::Plain {} => None,
-            Indexes::Hnsw(hnsw) => Some(hnsw),
+            Indexes::Hnsw(hnsw) => Some(hnsw.ef_construct),
+            // MIRAGE shares the HNSW search machinery, so the same
+            // `ef_construct` knob applies to its upper-layer build and
+            // dynamic ef calculation.
+            Indexes::Mirage(mirage) => Some(mirage.ef_construct),
         })
-        .map(|hnsw| hnsw.ef_construct)
 }
 
 #[cfg(test)]

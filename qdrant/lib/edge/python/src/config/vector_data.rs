@@ -79,6 +79,10 @@ impl FromPyObject<'_, '_> for PyIndexes {
             match indexes {
                 Indexes::Plain {} => (),
                 Indexes::Hnsw(_) => (),
+                // MIRAGE is not (yet) constructible from the Edge Python
+                // surface: we project it down to its HNSW-compatible view
+                // when crossing the Python boundary.
+                Indexes::Mirage(_) => (),
             }
         }
 
@@ -100,6 +104,12 @@ impl<'py> IntoPyObject<'py> for PyIndexes {
         match self.0 {
             Indexes::Plain {} => PyPlainIndexConfig.into_bound_py_any(py),
             Indexes::Hnsw(hnsw) => PyHnswIndexConfig(hnsw).into_bound_py_any(py),
+            // Project MIRAGE to its HNSW-compatible view for Python
+            // consumers; Mirage-specific knobs are only available through
+            // the native config surface.
+            Indexes::Mirage(mirage) => {
+                PyHnswIndexConfig(mirage.to_hnsw_compat()).into_bound_py_any(py)
+            }
         }
     }
 }
@@ -109,6 +119,9 @@ impl Repr for PyIndexes {
         match &self.0 {
             Indexes::Plain {} => PyPlainIndexConfig.fmt(f),
             Indexes::Hnsw(hnsw) => PyHnswIndexConfig::wrap_ref(hnsw).fmt(f),
+            Indexes::Mirage(mirage) => {
+                PyHnswIndexConfig(mirage.to_hnsw_compat()).fmt(f)
+            }
         }
     }
 }

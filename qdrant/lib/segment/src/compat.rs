@@ -224,6 +224,7 @@ mod tests {
             Indexes::Hnsw(hnsw) => {
                 assert_eq!(hnsw.m, 20);
             }
+            Indexes::Mirage(_) => panic!("expected HNSW index"),
         }
 
         match &new_segment.vector_data.get("vec2").unwrap().index {
@@ -231,6 +232,7 @@ mod tests {
             Indexes::Hnsw(hnsw) => {
                 assert_eq!(hnsw.m, 25);
             }
+            Indexes::Mirage(_) => panic!("expected HNSW index"),
         }
 
         if new_segment

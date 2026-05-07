@@ -635,6 +635,10 @@ pub enum Indexes {
     /// Use filterable HNSW index for approximate search. Is very fast even on a very huge collections,
     /// but require additional space to store index and additional time to build it.
     Hnsw(HnswConfig),
+    /// Use the MIRAGE-ANNS index (HNSW upper layers + refinement-based
+    /// Layer 0). Same runtime characteristics as HNSW but with significantly
+    /// faster index construction.
+    Mirage(MirageConfig),
 }
 
 impl Indexes {
@@ -642,6 +646,7 @@ impl Indexes {
         match self {
             Indexes::Plain {} => false,
             Indexes::Hnsw(_) => true,
+            Indexes::Mirage(_) => true,
         }
     }
 
@@ -649,6 +654,7 @@ impl Indexes {
         match self {
             Indexes::Plain {} => false,
             Indexes::Hnsw(config) => config.on_disk.unwrap_or_default(),
+            Indexes::Mirage(config) => config.on_disk.unwrap_or_default(),
         }
     }
 }
@@ -722,6 +728,140 @@ impl HnswConfig {
             // to flip this flag
             || on_disk != other.on_disk
             || inline_storage != other.inline_storage
+    }
+}
+
+/// Default refinement parameters for MIRAGE Layer 0. See
+/// [`crate::index::mirage_index::refinement_builder::RefinementParams`].
+pub const DEFAULT_MIRAGE_S: usize = 32;
+pub const DEFAULT_MIRAGE_R: usize = 4;
+pub const DEFAULT_MIRAGE_ITER: usize = 15;
+pub const DEFAULT_MIRAGE_NUM_REVERSE_EDGES: usize = 96;
+
+const fn default_mirage_s() -> usize {
+    DEFAULT_MIRAGE_S
+}
+const fn default_mirage_r() -> usize {
+    DEFAULT_MIRAGE_R
+}
+const fn default_mirage_iter() -> usize {
+    DEFAULT_MIRAGE_ITER
+}
+const fn default_mirage_num_reverse_edges() -> usize {
+    DEFAULT_MIRAGE_NUM_REVERSE_EDGES
+}
+
+/// Config of MIRAGE-ANNS index.
+///
+/// MIRAGE keeps HNSW's hierarchical structure (and therefore HNSW's runtime
+/// search code path) but replaces Layer 0 construction with a refinement
+/// pipeline that converges faster than incremental HNSW insertion. The
+/// HNSW-equivalent fields below (`m`, `ef_construct`, `full_scan_threshold`,
+/// `max_indexing_threads`, `on_disk`, `payload_m`) have the same semantics as
+/// in [`HnswConfig`]. The MIRAGE-specific fields (`s`, `r`, `iter`,
+/// `num_reverse_edges`) control the refinement pipeline.
+#[derive(
+    Copy, Clone, Debug, Eq, PartialEq, Deserialize, Serialize, JsonSchema, Validate, Anonymize,
+)]
+#[serde(rename_all = "snake_case")]
+#[anonymize(false)]
+pub struct MirageConfig {
+    /// Number of edges per node in upper layers (M, paper §3).
+    /// Layer 0 is capped at `2 * m` after RNG pruning.
+    pub m: usize,
+
+    /// `ef_construct` used when building upper layers. The reference MIRAGE
+    /// implementation uses 1024 to compensate for less data being available
+    /// during upper-layer build (Layer 0 is constructed separately and
+    /// concurrently). 1024 is a sensible default; 256+ is recommended.
+    #[validate(range(min = 4))]
+    pub ef_construct: usize,
+
+    /// Initial out-degree of the random graph at Layer 0 (paper's `S`).
+    /// Default 32.
+    #[serde(default = "default_mirage_s")]
+    #[validate(range(min = 4))]
+    pub s: usize,
+
+    /// Refinement rounds at Layer 0 (paper's `R`). Default 4.
+    #[serde(default = "default_mirage_r")]
+    #[validate(range(min = 1))]
+    pub r: usize,
+
+    /// Refinement iterations within each round (paper's `Iter`).
+    /// Default 15.
+    #[serde(default = "default_mirage_iter")]
+    #[validate(range(min = 1))]
+    pub iter: usize,
+
+    /// Cap on per-vertex pool size after a reverse-edge consolidation
+    /// pass. Reference C++ implementation uses 96.
+    #[serde(default = "default_mirage_num_reverse_edges")]
+    #[validate(range(min = 4))]
+    pub num_reverse_edges: usize,
+
+    /// Same semantic as [`HnswConfig::full_scan_threshold`].
+    #[serde(alias = "full_scan_threshold_kb")]
+    pub full_scan_threshold: usize,
+
+    /// Same semantic as [`HnswConfig::max_indexing_threads`].
+    #[serde(default = "default_max_indexing_threads")]
+    pub max_indexing_threads: usize,
+
+    /// Same semantic as [`HnswConfig::on_disk`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_disk: Option<bool>,
+
+    /// Same semantic as [`HnswConfig::payload_m`]. Phase 1 of the MIRAGE
+    /// integration in Qdrant does NOT build payload sub-graphs; this field
+    /// is preserved for forward compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload_m: Option<usize>,
+}
+
+impl Default for MirageConfig {
+    fn default() -> Self {
+        MirageConfig {
+            m: 16,
+            ef_construct: 1024,
+            s: DEFAULT_MIRAGE_S,
+            r: DEFAULT_MIRAGE_R,
+            iter: DEFAULT_MIRAGE_ITER,
+            num_reverse_edges: DEFAULT_MIRAGE_NUM_REVERSE_EDGES,
+            full_scan_threshold: DEFAULT_FULL_SCAN_THRESHOLD,
+            max_indexing_threads: 0,
+            on_disk: Some(false),
+            payload_m: None,
+        }
+    }
+}
+
+impl MirageConfig {
+    /// Returns true iff the configuration change requires a full index
+    /// rebuild (versus just a reload). Mirrors
+    /// [`HnswConfig::mismatch_requires_rebuild`].
+    pub fn mismatch_requires_rebuild(&self, other: &Self) -> bool {
+        let MirageConfig {
+            m,
+            ef_construct,
+            s,
+            r,
+            iter,
+            num_reverse_edges,
+            full_scan_threshold,
+            max_indexing_threads: _,
+            on_disk,
+            payload_m,
+        } = *self;
+        m != other.m
+            || ef_construct != other.ef_construct
+            || s != other.s
+            || r != other.r
+            || iter != other.iter
+            || num_reverse_edges != other.num_reverse_edges
+            || full_scan_threshold != other.full_scan_threshold
+            || on_disk != other.on_disk
+            || payload_m != other.payload_m
     }
 }
 
@@ -1663,6 +1803,7 @@ impl VectorDataConfig {
         let is_index_appendable = match self.index {
             Indexes::Plain {} => true,
             Indexes::Hnsw(_) => false,
+            Indexes::Mirage(_) => false,
         };
         let is_storage_appendable = match self.storage_type {
             VectorStorageType::Memory => true,

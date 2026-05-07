@@ -1,6 +1,7 @@
 pub mod field_index;
 pub mod hnsw_index;
 mod key_encoding;
+pub mod mirage_index;
 pub mod payload_config;
 mod payload_index_base;
 pub mod plain_payload_index;

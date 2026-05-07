@@ -83,11 +83,31 @@ impl ConfigMismatchOptimizer {
                 .vector_data
                 .iter()
                 .any(|(vector_name, vector_data)| {
-                    // Check HNSW mismatch
+                    // Check HNSW / MIRAGE mismatch
                     match &vector_data.index {
                         Indexes::Plain {} => {}
                         Indexes::Hnsw(effective_hnsw) => {
                             // Select segment if we have an HNSW mismatch that requires rebuild
+                            let target_hnsw = self
+                                .segment_optimizer_config
+                                .dense_vector
+                                .get(vector_name)
+                                .map(|cfg| cfg.hnsw_config)
+                                .unwrap_or(self.global_hnsw_config);
+                            if effective_hnsw.mismatch_requires_rebuild(&target_hnsw) {
+                                return true;
+                            }
+                        }
+                        Indexes::Mirage(effective_mirage) => {
+                            // For MIRAGE, only the HNSW-compatible knobs
+                            // participate in baseline mismatch checks. The
+                            // Mirage-specific refinement parameters
+                            // (`s`/`r`/`iter`/`num_reverse_edges`) are
+                            // currently not part of the (HNSW-only)
+                            // collection-wide optimizer config and are
+                            // therefore considered stable across optimizer
+                            // runs.
+                            let effective_hnsw = effective_mirage.to_hnsw_compat();
                             let target_hnsw = self
                                 .segment_optimizer_config
                                 .dense_vector

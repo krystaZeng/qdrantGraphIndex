@@ -9,7 +9,7 @@ use bitvec::vec::BitVec;
 use common::bitvec::BitSliceExt;
 use common::fixed_length_priority_queue::FixedLengthPriorityQueue;
 use common::fs::{atomic_save, atomic_save_bin};
-use common::types::{PointOffsetType, ScoredPointOffset};
+use common::types::{PointOffsetType, ScoreType, ScoredPointOffset};
 use parking_lot::{Mutex, MutexGuard, RwLock};
 use rand::distr::Uniform;
 use rand::{Rng, RngExt};
@@ -403,12 +403,35 @@ impl GraphLayersBuilder {
             .fetch_max(level, std::sync::atomic::Ordering::Relaxed);
     }
 
-    pub fn link_new_point(&self, point_id: PointOffsetType, mut points_scorer: FilteredScorer) {
+    pub fn link_new_point(&self, point_id: PointOffsetType, points_scorer: FilteredScorer) {
+        self.link_new_point_with_min_level(point_id, points_scorer, 0);
+    }
+
+    /// Link `point_id` into the graph, but only build edges on layers
+    /// `>= min_level`.
+    ///
+    /// This is used by MIRAGE to *only* run the standard HNSW
+    /// search-and-connect pass on Layers 1..N, leaving Layer 0 untouched
+    /// (Layer 0 is built separately via the refinement pipeline + injected
+    /// via [`Self::inject_layer0_with_heuristic`]).
+    ///
+    /// When `min_level == 0` this behaves exactly like [`Self::link_new_point`].
+    pub fn link_new_point_with_min_level(
+        &self,
+        point_id: PointOffsetType,
+        mut points_scorer: FilteredScorer,
+        min_level: usize,
+    ) {
         // Check if there is an suitable entry point
         //   - entry point level if higher or equal
         //   - it satisfies filters
 
         let level = self.get_point_level(point_id);
+
+        // Even when `min_level > 0` we still register `point_id` as an entry
+        // point candidate so subsequent search/insertion can find it. We
+        // also still mark it ready below so concurrent insertions can
+        // traverse it. Both are required for graph connectivity.
 
         let entry_point_opt = self
             .entry_points
@@ -437,13 +460,20 @@ impl GraphLayersBuilder {
             // minimal common level for entry points
             let linking_level = min(level, entry_point.level);
 
-            for curr_level in (0..=linking_level).rev() {
-                level_entry = self.link_new_point_on_level(
-                    point_id,
-                    curr_level,
-                    &mut points_scorer,
-                    level_entry,
-                );
+            // Walk levels top-down but stop at `min_level`. If
+            // `linking_level < min_level` (e.g. the new point lives only
+            // at Layer 0 while we asked for Layer 1+), the loop body just
+            // won't execute, which is correct: there's nothing to do for
+            // this point at the requested layers.
+            if linking_level >= min_level {
+                for curr_level in (min_level..=linking_level).rev() {
+                    level_entry = self.link_new_point_on_level(
+                        point_id,
+                        curr_level,
+                        &mut points_scorer,
+                        level_entry,
+                    );
+                }
             }
         } else {
             // New point is a new empty entry (for this filter, at least)
@@ -459,6 +489,32 @@ impl GraphLayersBuilder {
             .new_point(point_id, level, |point_id| {
                 points_scorer.filters().check_vector(point_id)
             });
+    }
+
+    /// Inject a pre-computed Layer 0 candidate list for `point_id`,
+    /// applying the standard HNSW RNG-style heuristic to fit them into
+    /// `m0` slots.
+    ///
+    /// `candidates` must be **sorted closest-first** (descending score),
+    /// non-self-referential, and free of soft-deleted neighbors.
+    ///
+    /// `score` is a symmetric pairwise scorer used by the heuristic to
+    /// evaluate candidate-vs-already-kept neighbor distances. Higher score
+    /// = closer (Qdrant convention).
+    ///
+    /// This is the entry point used by MIRAGE: after the refinement
+    /// pipeline produces a (possibly oversized) candidate pool per point,
+    /// we hand it off to the same RNG-pruning routine HNSW uses
+    /// internally, ensuring graph quality / shape parity with HNSW Layer
+    /// 0.
+    pub fn inject_layer0_with_heuristic(
+        &self,
+        point_id: PointOffsetType,
+        candidates: impl Iterator<Item = ScoredPointOffset>,
+        score: impl FnMut(PointOffsetType, PointOffsetType) -> ScoreType,
+    ) {
+        let mut layer0 = self.links_layers[point_id as usize][0].write();
+        layer0.fill_from_sorted_with_heuristic(candidates, self.hnsw_m.m0, score);
     }
 
     /// Add a new point using pre-existing links.
