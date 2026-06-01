@@ -1,6 +1,6 @@
 //! On-disk graph configuration for the MIRAGE index.
 //!
-//! This is the analog of [`crate::index::hnsw_index::config::HnswGraphConfig`],
+//! This is the analog of [`crate::index::hnsw_index::HnswGraphConfig`],
 //! but persists the additional MIRAGE-specific Layer 0 refinement parameters.
 //!
 //! The MIRAGE index produces a graph that is *structurally* identical to an
@@ -37,7 +37,7 @@ pub const MIRAGE_INDEX_CONFIG_FILE: &str = "mirage_config.json";
 /// shared search and storage code paths) and the MIRAGE-specific Layer 0
 /// refinement parameters.
 ///
-/// [`HnswGraphConfig`]: crate::index::hnsw_index::config::HnswGraphConfig
+/// [`HnswGraphConfig`]: crate::index::hnsw_index::HnswGraphConfig
 #[derive(Debug, Deserialize, Serialize, Copy, Clone, PartialEq, Eq)]
 pub struct MirageGraphConfig {
     /// `M` for upper layers (Layers 1..N).
@@ -64,7 +64,7 @@ pub struct MirageGraphConfig {
     pub full_scan_threshold: usize,
 
     /// Initial out-degree of the random graph at Layer 0 (paper's `S`).
-    /// Recommended: 32.
+    /// Reference C++ default: 16.
     pub s: usize,
 
     /// Number of refinement rounds at Layer 0 (paper's `R`).
@@ -162,9 +162,9 @@ impl MirageGraphConfig {
     /// MIRAGE-specific build params (`s`, `r`, `iter`, `num_reverse_edges`)
     /// are not exposed by it because they only matter at build time.
     ///
-    /// [`HnswGraphConfig`]: crate::index::hnsw_index::config::HnswGraphConfig
-    pub fn to_hnsw_compat(&self) -> crate::index::hnsw_index::config::HnswGraphConfig {
-        let mut cfg = crate::index::hnsw_index::config::HnswGraphConfig {
+    /// [`HnswGraphConfig`]: crate::index::hnsw_index::HnswGraphConfig
+    pub fn to_hnsw_compat(&self) -> crate::index::hnsw_index::HnswGraphConfig {
+        let mut cfg = crate::index::hnsw_index::HnswGraphConfig {
             m: self.m,
             m0: self.m0,
             ef_construct: self.ef_construct,

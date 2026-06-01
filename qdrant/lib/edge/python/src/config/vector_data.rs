@@ -119,9 +119,7 @@ impl Repr for PyIndexes {
         match &self.0 {
             Indexes::Plain {} => PyPlainIndexConfig.fmt(f),
             Indexes::Hnsw(hnsw) => PyHnswIndexConfig::wrap_ref(hnsw).fmt(f),
-            Indexes::Mirage(mirage) => {
-                PyHnswIndexConfig(mirage.to_hnsw_compat()).fmt(f)
-            }
+            Indexes::Mirage(mirage) => PyHnswIndexConfig(mirage.to_hnsw_compat()).fmt(f),
         }
     }
 }

@@ -4,13 +4,17 @@ use std::sync::Arc;
 
 use itertools::Itertools;
 use parking_lot::Mutex;
+use segment::common::BYTES_IN_KB;
 use segment::common::operation_time_statistics::OperationDurationsAggregator;
 use segment::entry::ReadSegmentEntry;
 use segment::index::sparse_index::sparse_index_config::SparseIndexType;
 use segment::types::{HnswConfig, HnswGlobalConfig, Indexes, VectorName};
 
-use super::config::SegmentOptimizerConfig;
-use super::segment_optimizer::{OptimizationPlanner, SegmentOptimizer};
+use super::config::{DenseVectorOptimizerConfig, SegmentOptimizerConfig};
+use super::segment_optimizer::{
+    OptimizationPlanner, SegmentOptimizer, apply_dense_storage_policy, experimental_mirage_enabled,
+    resolve_desired_dense_index,
+};
 use crate::operations::optimization::OptimizerThresholds;
 
 /// Looks for segments having a mismatch between configured and actual parameters
@@ -26,6 +30,27 @@ pub struct ConfigMismatchOptimizer {
     global_hnsw_config: HnswConfig,
     hnsw_global_config: HnswGlobalConfig,
     telemetry_durations_aggregator: Arc<Mutex<OperationDurationsAggregator>>,
+}
+
+fn dense_index_kind(index: &Indexes) -> &'static str {
+    match index {
+        Indexes::Plain {} => "plain",
+        Indexes::Hnsw(_) => "hnsw",
+        Indexes::Mirage(_) => "mirage",
+    }
+}
+
+fn dense_index_mismatch_requires_rebuild(current: &Indexes, target: &Indexes) -> bool {
+    match (current, target) {
+        (Indexes::Plain {}, Indexes::Plain {}) => false,
+        (Indexes::Hnsw(current), Indexes::Hnsw(target)) => {
+            current.mismatch_requires_rebuild(target)
+        }
+        (Indexes::Mirage(current), Indexes::Mirage(target)) => {
+            current.mismatch_requires_rebuild(target)
+        }
+        _ => true,
+    }
 }
 
 impl ConfigMismatchOptimizer {
@@ -77,47 +102,95 @@ impl ConfigMismatchOptimizer {
             return true; // Optimize segment due to payload storage mismatch
         }
 
+        let segment_vector_size = match segment.max_available_vectors_size_in_bytes() {
+            Ok(size) => size,
+            Err(err) => {
+                log::warn!(
+                    "Failed to estimate vector size for config mismatch on segment {}; conservatively requiring rebuild: {err}",
+                    segment.segment_uuid(),
+                );
+                return true;
+            }
+        };
+
+        let threshold_is_indexed = segment_vector_size
+            >= self
+                .thresholds_config
+                .indexing_threshold_kb
+                .saturating_mul(BYTES_IN_KB);
+        let threshold_is_on_disk = segment_vector_size
+            >= self
+                .thresholds_config
+                .memmap_threshold_kb
+                .saturating_mul(BYTES_IN_KB);
+        let use_mirage = experimental_mirage_enabled();
+
         // Determine whether dense data in segment has mismatch
         let dense_has_mismatch =
             segment_config
                 .vector_data
                 .iter()
                 .any(|(vector_name, vector_data)| {
-                    // Check HNSW / MIRAGE mismatch
-                    match &vector_data.index {
-                        Indexes::Plain {} => {}
-                        Indexes::Hnsw(effective_hnsw) => {
-                            // Select segment if we have an HNSW mismatch that requires rebuild
-                            let target_hnsw = self
-                                .segment_optimizer_config
-                                .dense_vector
-                                .get(vector_name)
-                                .map(|cfg| cfg.hnsw_config)
-                                .unwrap_or(self.global_hnsw_config);
-                            if effective_hnsw.mismatch_requires_rebuild(&target_hnsw) {
-                                return true;
-                            }
+                    let default_vector_cfg;
+                    let vector_cfg = match self.segment_optimizer_config.dense_vector.get(vector_name) {
+                        Some(vector_cfg) => vector_cfg,
+                        None => {
+                            default_vector_cfg = DenseVectorOptimizerConfig {
+                                on_disk: None,
+                                hnsw_config: self.global_hnsw_config,
+                                quantization_config: None,
+                            };
+                            &default_vector_cfg
                         }
-                        Indexes::Mirage(effective_mirage) => {
-                            // For MIRAGE, only the HNSW-compatible knobs
-                            // participate in baseline mismatch checks. The
-                            // Mirage-specific refinement parameters
-                            // (`s`/`r`/`iter`/`num_reverse_edges`) are
-                            // currently not part of the (HNSW-only)
-                            // collection-wide optimizer config and are
-                            // therefore considered stable across optimizer
-                            // runs.
-                            let effective_hnsw = effective_mirage.to_hnsw_compat();
-                            let target_hnsw = self
-                                .segment_optimizer_config
-                                .dense_vector
-                                .get(vector_name)
-                                .map(|cfg| cfg.hnsw_config)
-                                .unwrap_or(self.global_hnsw_config);
-                            if effective_hnsw.mismatch_requires_rebuild(&target_hnsw) {
-                                return true;
-                            }
+                    };
+
+                    let mut target_vector_data = self
+                        .segment_optimizer_config
+                        .plain_dense_vector_config
+                        .get(vector_name)
+                        .cloned()
+                        .unwrap_or_else(|| {
+                            let mut target = vector_data.clone();
+                            target.index = Indexes::Plain {};
+                            target.quantization_config = None;
+                            target
+                        });
+
+                    apply_dense_storage_policy(
+                        &mut target_vector_data,
+                        Some(vector_cfg),
+                        threshold_is_indexed,
+                        threshold_is_on_disk,
+                    );
+
+                    if threshold_is_indexed {
+                        target_vector_data.quantization_config =
+                            vector_cfg.quantization_config.clone();
+                    }
+
+                    target_vector_data.index = resolve_desired_dense_index(
+                        &target_vector_data,
+                        vector_cfg,
+                        threshold_is_indexed,
+                        use_mirage,
+                    );
+
+                    if dense_index_mismatch_requires_rebuild(
+                        &vector_data.index,
+                        &target_vector_data.index,
+                    ) {
+                        let current_index_kind = dense_index_kind(&vector_data.index);
+                        let target_index_kind = dense_index_kind(&target_vector_data.index);
+                        if current_index_kind == target_index_kind {
+                            log::debug!(
+                                "Dense vector {vector_name} {current_index_kind} index config mismatch; requiring config-mismatch rebuild",
+                            );
+                        } else {
+                            log::info!(
+                                "Dense vector {vector_name} desired index type changed from {current_index_kind} to {target_index_kind}; requiring config-mismatch rebuild",
+                            );
                         }
+                        return true;
                     }
 
                     if let Some(is_required_on_disk) = self.check_if_vectors_on_disk(vector_name)
@@ -127,11 +200,7 @@ impl ConfigMismatchOptimizer {
                     }
 
                     // Check quantization mismatch
-                    let target_quantization = self
-                        .segment_optimizer_config
-                        .dense_vector
-                        .get(vector_name)
-                        .and_then(|cfg| cfg.quantization_config.as_ref());
+                    let target_quantization = target_vector_data.quantization_config.as_ref();
 
                     vector_data
                         .quantization_config

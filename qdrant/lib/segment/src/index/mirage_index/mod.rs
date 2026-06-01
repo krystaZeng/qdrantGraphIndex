@@ -8,6 +8,7 @@
 //! and `segment_constructor`.
 
 pub mod config;
+pub(crate) mod faiss_random;
 pub mod mirage;
 pub mod refinement_builder;
 

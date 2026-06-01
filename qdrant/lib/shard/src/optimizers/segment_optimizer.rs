@@ -16,10 +16,13 @@ use segment::index::sparse_index::sparse_index_config::SparseIndexType;
 use segment::segment::Segment;
 use segment::segment_constructor::build_segment;
 use segment::segment_constructor::segment_builder::SegmentBuilder;
-use segment::types::{HnswGlobalConfig, Indexes, VectorStorageType};
+use segment::types::{
+    HnswGlobalConfig, Indexes, MirageConfig, VectorDataConfig, VectorStorageDatatype,
+    VectorStorageType,
+};
 use uuid::Uuid;
 
-use super::config::SegmentOptimizerConfig;
+use super::config::{DenseVectorOptimizerConfig, SegmentOptimizerConfig};
 use crate::locked_segment::LockedSegment;
 use crate::operations::optimization::OptimizerThresholds;
 use crate::optimize::{OptimizationPaths, OptimizationStrategy, execute_optimization};
@@ -27,6 +30,88 @@ use crate::segment_holder::locked::LockedSegmentHolder;
 use crate::segment_holder::{SegmentHolder, SegmentId};
 
 const BYTES_IN_KB: usize = 1024;
+
+pub(super) fn experimental_mirage_enabled() -> bool {
+    std::env::var("QDRANT_EXPERIMENTAL_MIRAGE")
+        .map(|value| value == "1" || value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+fn mirage_p0_storage_supported(storage_type: VectorStorageType) -> bool {
+    matches!(
+        storage_type,
+        VectorStorageType::Memory | VectorStorageType::InRamChunkedMmap
+    )
+}
+
+pub(super) fn mirage_p0_unsupported_reason(
+    config: &VectorDataConfig,
+    vector_cfg: &DenseVectorOptimizerConfig,
+) -> Option<&'static str> {
+    if config.multivector_config.is_some() {
+        return Some("multi-vector is not supported");
+    }
+
+    if config.datatype.unwrap_or(VectorStorageDatatype::Float32) != VectorStorageDatatype::Float32 {
+        return Some("non-float32 vector storage is not supported");
+    }
+
+    if vector_cfg.quantization_config.is_some() {
+        return Some("quantization is not supported");
+    }
+
+    if !mirage_p0_storage_supported(config.storage_type) {
+        return Some("mmap/on-disk vector storage is not supported");
+    }
+
+    None
+}
+
+pub(super) fn apply_dense_storage_policy(
+    config: &mut VectorDataConfig,
+    vector_cfg: Option<&DenseVectorOptimizerConfig>,
+    threshold_is_indexed: bool,
+    threshold_is_on_disk: bool,
+) {
+    if !(threshold_is_on_disk || threshold_is_indexed) {
+        return;
+    }
+
+    let config_on_disk = vector_cfg.and_then(|cfg| cfg.on_disk);
+
+    match config_on_disk {
+        Some(true) => config.storage_type = VectorStorageType::Mmap, // Both agree, but prefer mmap storage type
+        Some(false) => {
+            if common::flags::feature_flags().single_file_mmap_vector_storage {
+                config.storage_type = VectorStorageType::InRamMmap;
+            }
+        } // on_disk=false wins, do nothing
+        None => {
+            if threshold_is_on_disk {
+                config.storage_type = VectorStorageType::Mmap
+            } else if common::flags::feature_flags().single_file_mmap_vector_storage {
+                config.storage_type = VectorStorageType::InRamMmap;
+            }
+        } // Mmap threshold wins
+    }
+}
+
+pub(super) fn resolve_desired_dense_index(
+    vector_config: &VectorDataConfig,
+    vector_cfg: &DenseVectorOptimizerConfig,
+    threshold_is_indexed: bool,
+    use_mirage: bool,
+) -> Indexes {
+    if !threshold_is_indexed {
+        return Indexes::Plain {};
+    }
+
+    if use_mirage && mirage_p0_unsupported_reason(vector_config, vector_cfg).is_none() {
+        Indexes::Mirage(MirageConfig::from_hnsw(vector_cfg.hnsw_config))
+    } else {
+        Indexes::Hnsw(vector_cfg.hnsw_config)
+    }
+}
 
 /// Resolves per-vector HNSW max_indexing_threads (0 = auto) and returns the actual thread count.
 pub fn max_num_indexing_threads(segment_optimizer_config: &SegmentOptimizerConfig) -> usize {
@@ -206,18 +291,6 @@ pub trait SegmentOptimizer: Sync {
         let mut vector_data = segment_optimizer_config.plain_dense_vector_config.clone();
         let mut sparse_vector_data = segment_optimizer_config.plain_sparse_vector_config.clone();
 
-        // If indexing, change to HNSW index and quantization
-        if threshold_is_indexed {
-            vector_data.iter_mut().for_each(|(vector_name, config)| {
-                if let Some(vector_cfg) = segment_optimizer_config.dense_vector.get(vector_name) {
-                    // Assign HNSW index
-                    config.index = Indexes::Hnsw(vector_cfg.hnsw_config);
-                    // Assign quantization config
-                    config.quantization_config = vector_cfg.quantization_config.clone();
-                }
-            });
-        }
-
         // We want to use single-file mmap in the following cases:
         // - It is explicitly configured by `mmap_threshold` -> threshold_is_on_disk=true
         // - The segment is indexed and configured on disk -> threshold_is_indexed=true && config_on_disk=Some(true)
@@ -229,21 +302,12 @@ pub trait SegmentOptimizer: Sync {
                     .get(vector_name)
                     .and_then(|cfg| cfg.on_disk);
 
-                match config_on_disk {
-                    Some(true) => config.storage_type = VectorStorageType::Mmap, // Both agree, but prefer mmap storage type
-                    Some(false) => {
-                        if common::flags::feature_flags().single_file_mmap_vector_storage {
-                            config.storage_type = VectorStorageType::InRamMmap;
-                        }
-                    } // on_disk=false wins, do nothing
-                    None => {
-                        if threshold_is_on_disk {
-                            config.storage_type = VectorStorageType::Mmap
-                        } else if common::flags::feature_flags().single_file_mmap_vector_storage {
-                            config.storage_type = VectorStorageType::InRamMmap;
-                        }
-                    } // Mmap threshold wins
-                }
+                apply_dense_storage_policy(
+                    config,
+                    segment_optimizer_config.dense_vector.get(vector_name),
+                    threshold_is_indexed,
+                    threshold_is_on_disk,
+                );
 
                 // If we explicitly configure on_disk, but the segment storage type uses something
                 // that doesn't match, warn about it
@@ -253,6 +317,40 @@ pub trait SegmentOptimizer: Sync {
                     log::warn!(
                         "Collection config for vector {vector_name} has on_disk={config_on_disk:?} configured, but storage type for segment doesn't match it"
                     );
+                }
+            });
+        }
+
+        // If indexing, change to HNSW/Mirage index and quantization after the
+        // final storage type is known. This is important for Mirage P0: an
+        // indexed segment may be changed to `InRamMmap` above, which is still
+        // mmap-backed at runtime and must fall back to HNSW.
+        if threshold_is_indexed {
+            let use_mirage = experimental_mirage_enabled();
+            vector_data.iter_mut().for_each(|(vector_name, config)| {
+                if let Some(vector_cfg) = segment_optimizer_config.dense_vector.get(vector_name) {
+                    config.quantization_config = vector_cfg.quantization_config.clone();
+
+                    let resolved_index = resolve_desired_dense_index(
+                        config,
+                        vector_cfg,
+                        threshold_is_indexed,
+                        use_mirage,
+                    );
+
+                    if use_mirage {
+                        if matches!(resolved_index, Indexes::Mirage(_)) {
+                            log::info!(
+                                "Experimental Mirage index enabled for optimized dense vector segment, vector {vector_name}"
+                            );
+                        } else if let Some(reason) = mirage_p0_unsupported_reason(config, vector_cfg) {
+                            log::warn!(
+                                "Experimental Mirage index requested for vector {vector_name}, but falling back to HNSW because {reason}"
+                            );
+                        }
+                    }
+
+                    config.index = resolved_index;
                 }
             });
         }
@@ -448,4 +546,174 @@ pub fn plan_optimizations(
         .inspect(|(optimizer, _segments)| debug_assert!(optimizer.is_some()))
         .filter_map(|(optimizer, segments)| Some((optimizer?, segments)))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use segment::types::{
+        Distance, HnswConfig, Indexes, MirageConfig, MultiVectorComparator, MultiVectorConfig,
+        QuantizationConfig, ScalarQuantization, ScalarQuantizationConfig, VectorStorageDatatype,
+        VectorStorageType,
+    };
+
+    use super::*;
+
+    fn vector_config() -> VectorDataConfig {
+        VectorDataConfig {
+            size: 4,
+            distance: Distance::Dot,
+            storage_type: VectorStorageType::Memory,
+            index: Indexes::Plain {},
+            quantization_config: None,
+            multivector_config: None,
+            datatype: None,
+        }
+    }
+
+    fn dense_vector_config() -> DenseVectorOptimizerConfig {
+        DenseVectorOptimizerConfig {
+            on_disk: None,
+            hnsw_config: HnswConfig::default(),
+            quantization_config: None,
+        }
+    }
+
+    fn scalar_quantization_config() -> QuantizationConfig {
+        QuantizationConfig::Scalar(ScalarQuantization {
+            scalar: ScalarQuantizationConfig {
+                r#type: Default::default(),
+                quantile: None,
+                always_ram: None,
+            },
+        })
+    }
+
+    #[test]
+    fn test_mirage_p0_supported_for_plain_float32_in_memory_vector() {
+        let config = vector_config();
+        let vector_cfg = dense_vector_config();
+
+        assert_eq!(mirage_p0_unsupported_reason(&config, &vector_cfg), None);
+    }
+
+    #[test]
+    fn test_mirage_p0_rejects_multi_vector() {
+        let mut config = vector_config();
+        let vector_cfg = dense_vector_config();
+        config.multivector_config = Some(MultiVectorConfig {
+            comparator: MultiVectorComparator::MaxSim,
+        });
+
+        assert_eq!(
+            mirage_p0_unsupported_reason(&config, &vector_cfg),
+            Some("multi-vector is not supported"),
+        );
+    }
+
+    #[test]
+    fn test_mirage_p0_rejects_non_float32_vector_storage() {
+        let mut config = vector_config();
+        let vector_cfg = dense_vector_config();
+        config.datatype = Some(VectorStorageDatatype::Uint8);
+
+        assert_eq!(
+            mirage_p0_unsupported_reason(&config, &vector_cfg),
+            Some("non-float32 vector storage is not supported"),
+        );
+    }
+
+    #[test]
+    fn test_mirage_p0_rejects_quantization() {
+        let config = vector_config();
+        let mut vector_cfg = dense_vector_config();
+        vector_cfg.quantization_config = Some(scalar_quantization_config());
+
+        assert_eq!(
+            mirage_p0_unsupported_reason(&config, &vector_cfg),
+            Some("quantization is not supported"),
+        );
+    }
+
+    #[test]
+    fn test_mirage_p0_rejects_on_disk_vector_storage() {
+        let mut config = vector_config();
+        let vector_cfg = dense_vector_config();
+        config.storage_type = VectorStorageType::Mmap;
+
+        assert_eq!(
+            mirage_p0_unsupported_reason(&config, &vector_cfg),
+            Some("mmap/on-disk vector storage is not supported"),
+        );
+    }
+
+    #[test]
+    fn test_mirage_p0_rejects_in_ram_mmap_storage_type() {
+        let mut config = vector_config();
+        let vector_cfg = dense_vector_config();
+        config.storage_type = VectorStorageType::InRamMmap;
+
+        assert_eq!(
+            mirage_p0_unsupported_reason(&config, &vector_cfg),
+            Some("mmap/on-disk vector storage is not supported"),
+        );
+    }
+
+    #[test]
+    fn test_mirage_p0_accepts_in_ram_chunked_mmap_storage_type() {
+        let mut config = vector_config();
+        let vector_cfg = dense_vector_config();
+        config.storage_type = VectorStorageType::InRamChunkedMmap;
+
+        assert_eq!(mirage_p0_unsupported_reason(&config, &vector_cfg), None);
+    }
+
+    #[test]
+    fn test_resolve_desired_dense_index_returns_plain_below_indexing_threshold() {
+        let config = vector_config();
+        let vector_cfg = dense_vector_config();
+
+        let index = resolve_desired_dense_index(&config, &vector_cfg, false, true);
+
+        assert!(matches!(index, Indexes::Plain {}));
+    }
+
+    #[test]
+    fn test_resolve_desired_dense_index_uses_mirage_when_enabled_and_supported() {
+        let config = vector_config();
+        let vector_cfg = dense_vector_config();
+
+        let index = resolve_desired_dense_index(&config, &vector_cfg, true, true);
+
+        assert!(matches!(
+            index,
+            Indexes::Mirage(mirage) if mirage == MirageConfig::from_hnsw(vector_cfg.hnsw_config)
+        ));
+    }
+
+    #[test]
+    fn test_resolve_desired_dense_index_uses_hnsw_when_mirage_disabled() {
+        let config = vector_config();
+        let vector_cfg = dense_vector_config();
+
+        let index = resolve_desired_dense_index(&config, &vector_cfg, true, false);
+
+        assert!(matches!(
+            index,
+            Indexes::Hnsw(hnsw) if hnsw == vector_cfg.hnsw_config
+        ));
+    }
+
+    #[test]
+    fn test_resolve_desired_dense_index_falls_back_to_hnsw_for_unsupported_p0_storage() {
+        let mut config = vector_config();
+        let vector_cfg = dense_vector_config();
+        config.storage_type = VectorStorageType::InRamMmap;
+
+        let index = resolve_desired_dense_index(&config, &vector_cfg, true, true);
+
+        assert!(matches!(
+            index,
+            Indexes::Hnsw(hnsw) if hnsw == vector_cfg.hnsw_config
+        ));
+    }
 }

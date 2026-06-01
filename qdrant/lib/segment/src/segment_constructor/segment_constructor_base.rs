@@ -314,6 +314,57 @@ pub struct VectorIndexBuildArgs<'a, R: Rng + ?Sized> {
     pub progress: ProgressTracker,
 }
 
+fn validate_mirage_p0_vector_config(vector_config: &VectorDataConfig) -> OperationResult<()> {
+    let Indexes::Mirage(mirage_config) = &vector_config.index else {
+        return Ok(());
+    };
+
+    if vector_config.multivector_config.is_some() {
+        return Err(OperationError::validation_error(
+            "Mirage P0 does not support multi-vector storage",
+        ));
+    }
+
+    if vector_config
+        .datatype
+        .unwrap_or(VectorStorageDatatype::Float32)
+        != VectorStorageDatatype::Float32
+    {
+        return Err(OperationError::validation_error(
+            "Mirage P0 supports Float32 vector storage only",
+        ));
+    }
+
+    if vector_config.quantization_config.is_some() {
+        return Err(OperationError::validation_error(
+            "Mirage P0 does not support quantization",
+        ));
+    }
+
+    if !matches!(
+        vector_config.storage_type,
+        VectorStorageType::Memory | VectorStorageType::InRamChunkedMmap
+    ) {
+        return Err(OperationError::validation_error(
+            "Mirage P0 does not support mmap/on-disk vector storage",
+        ));
+    }
+
+    if mirage_config.on_disk == Some(true) {
+        return Err(OperationError::validation_error(
+            "Mirage P0 does not support on-disk Mirage index",
+        ));
+    }
+
+    if mirage_config.payload_m.is_some() {
+        return Err(OperationError::validation_error(
+            "Mirage P0 does not support payload-aware subgraphs",
+        ));
+    }
+
+    Ok(())
+}
+
 pub(crate) fn open_vector_index(
     vector_config: &VectorDataConfig,
     open_args: VectorIndexOpenArgs,
@@ -340,8 +391,9 @@ pub(crate) fn open_vector_index(
             payload_index,
             hnsw_config: *hnsw_config,
         })?),
-        Indexes::Mirage(mirage_config) => VectorIndexEnum::Mirage(
-            crate::index::mirage_index::MirageIndex::open(
+        Indexes::Mirage(mirage_config) => {
+            validate_mirage_p0_vector_config(vector_config)?;
+            VectorIndexEnum::Mirage(crate::index::mirage_index::MirageIndex::open(
                 crate::index::mirage_index::MirageIndexOpenArgs {
                     path,
                     id_tracker,
@@ -350,8 +402,8 @@ pub(crate) fn open_vector_index(
                     payload_index,
                     mirage_config: *mirage_config,
                 },
-            )?,
-        ),
+            )?)
+        }
     })
 }
 
@@ -385,8 +437,9 @@ pub(crate) fn build_vector_index<R: Rng + ?Sized>(
             },
             build_args,
         )?),
-        Indexes::Mirage(mirage_config) => VectorIndexEnum::Mirage(
-            crate::index::mirage_index::MirageIndex::build(
+        Indexes::Mirage(mirage_config) => {
+            validate_mirage_p0_vector_config(vector_config)?;
+            VectorIndexEnum::Mirage(crate::index::mirage_index::MirageIndex::build(
                 crate::index::mirage_index::MirageIndexOpenArgs {
                     path,
                     id_tracker,
@@ -396,8 +449,8 @@ pub(crate) fn build_vector_index<R: Rng + ?Sized>(
                     mirage_config: *mirage_config,
                 },
                 build_args,
-            )?,
-        ),
+            )?)
+        }
     })
 }
 
@@ -1632,4 +1685,135 @@ pub fn migrate_rocksdb_payload_storage_to_mmap(
     };
 
     Ok(new_storage)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{
+        MirageConfig, MultiVectorComparator, MultiVectorConfig, QuantizationConfig,
+        ScalarQuantization, ScalarQuantizationConfig,
+    };
+
+    fn mirage_vector_config() -> VectorDataConfig {
+        VectorDataConfig {
+            size: 4,
+            distance: Distance::Dot,
+            storage_type: VectorStorageType::InRamChunkedMmap,
+            index: Indexes::Mirage(MirageConfig::default()),
+            quantization_config: None,
+            multivector_config: None,
+            datatype: None,
+        }
+    }
+
+    fn scalar_quantization_config() -> QuantizationConfig {
+        QuantizationConfig::Scalar(ScalarQuantization {
+            scalar: ScalarQuantizationConfig {
+                r#type: Default::default(),
+                quantile: None,
+                always_ram: None,
+            },
+        })
+    }
+
+    fn expect_mirage_p0_validation_error(config: &VectorDataConfig, expected: &str) {
+        let err = validate_mirage_p0_vector_config(config).unwrap_err();
+        assert!(matches!(
+            err,
+            OperationError::ValidationError { description } if description == expected
+        ));
+    }
+
+    #[test]
+    fn test_validate_mirage_p0_accepts_default_and_float32_datatype() {
+        let config = mirage_vector_config();
+        validate_mirage_p0_vector_config(&config).unwrap();
+
+        let mut config = mirage_vector_config();
+        config.datatype = Some(VectorStorageDatatype::Float32);
+        validate_mirage_p0_vector_config(&config).unwrap();
+    }
+
+    #[test]
+    fn test_validate_mirage_p0_rejects_multi_vector() {
+        let mut config = mirage_vector_config();
+        config.multivector_config = Some(MultiVectorConfig {
+            comparator: MultiVectorComparator::MaxSim,
+        });
+
+        expect_mirage_p0_validation_error(
+            &config,
+            "Mirage P0 does not support multi-vector storage",
+        );
+    }
+
+    #[test]
+    fn test_validate_mirage_p0_rejects_non_float32_datatype() {
+        let mut config = mirage_vector_config();
+        config.datatype = Some(VectorStorageDatatype::Uint8);
+
+        expect_mirage_p0_validation_error(
+            &config,
+            "Mirage P0 supports Float32 vector storage only",
+        );
+    }
+
+    #[test]
+    fn test_validate_mirage_p0_rejects_quantization() {
+        let mut config = mirage_vector_config();
+        config.quantization_config = Some(scalar_quantization_config());
+
+        expect_mirage_p0_validation_error(&config, "Mirage P0 does not support quantization");
+    }
+
+    #[test]
+    fn test_validate_mirage_p0_rejects_on_disk_vector_storage() {
+        let mut config = mirage_vector_config();
+        config.storage_type = VectorStorageType::Mmap;
+
+        expect_mirage_p0_validation_error(
+            &config,
+            "Mirage P0 does not support mmap/on-disk vector storage",
+        );
+    }
+
+    #[test]
+    fn test_validate_mirage_p0_rejects_in_ram_mmap_vector_storage() {
+        let mut config = mirage_vector_config();
+        config.storage_type = VectorStorageType::InRamMmap;
+
+        expect_mirage_p0_validation_error(
+            &config,
+            "Mirage P0 does not support mmap/on-disk vector storage",
+        );
+    }
+
+    #[test]
+    fn test_validate_mirage_p0_rejects_on_disk_mirage_index() {
+        let mut config = mirage_vector_config();
+        config.index = Indexes::Mirage(MirageConfig {
+            on_disk: Some(true),
+            ..Default::default()
+        });
+
+        expect_mirage_p0_validation_error(
+            &config,
+            "Mirage P0 does not support on-disk Mirage index",
+        );
+    }
+
+    #[test]
+    fn test_validate_mirage_p0_rejects_payload_subgraph() {
+        let mut config = mirage_vector_config();
+        config.index = Indexes::Mirage(MirageConfig {
+            payload_m: Some(16),
+            ..Default::default()
+        });
+
+        expect_mirage_p0_validation_error(
+            &config,
+            "Mirage P0 does not support payload-aware subgraphs",
+        );
+    }
 }

@@ -4,6 +4,7 @@ use std::io::Write;
 use std::ops::ControlFlow;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
+use std::time::{Duration, Instant};
 
 use bitvec::vec::BitVec;
 use common::bitvec::BitSliceExt;
@@ -48,6 +49,12 @@ pub struct GraphLayersBuilder {
 
     // List of bool flags, which defines if the point is already indexed or not
     ready_list: BitVec<AtomicUsize>,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct GraphLayersPersistTimings {
+    pub materialize_graph: Duration,
+    pub persist_graph: Duration,
 }
 
 impl GraphLayersBase for GraphLayersBuilder {
@@ -242,6 +249,36 @@ impl GraphLayersBuilder {
         })
     }
 
+    pub(crate) fn persist_graph_layers(
+        self,
+        path: &Path,
+        format_param: GraphLinksFormatParam,
+    ) -> OperationResult<GraphLayersPersistTimings> {
+        let mut timings = GraphLayersPersistTimings::default();
+        let links_path = GraphLayers::get_links_path(path, format_param.as_format());
+
+        let timer = Instant::now();
+        let edges = Self::links_layers_to_edges(self.links_layers);
+        let entry_points = self.entry_points.into_inner();
+        timings.materialize_graph = timer.elapsed();
+
+        let timer = Instant::now();
+        atomic_save(&links_path, |writer| {
+            serialize_graph_links(edges, format_param, self.hnsw_m, writer)
+        })?;
+
+        let data = GraphLayerData {
+            m: self.hnsw_m.m,
+            m0: self.hnsw_m.m0,
+            ef_construct: self.ef_construct,
+            entry_points: Cow::Borrowed(&entry_points),
+        };
+        atomic_save_bin(&GraphLayers::get_path(path), &data)?;
+        timings.persist_graph = timer.elapsed();
+
+        Ok(timings)
+    }
+
     #[cfg(feature = "testing")]
     pub fn into_graph_layers_ram(self, format_param: GraphLinksFormatParam<'_>) -> GraphLayers {
         let edges = Self::links_layers_to_edges(self.links_layers);
@@ -407,6 +444,23 @@ impl GraphLayersBuilder {
         self.link_new_point_with_min_level(point_id, points_scorer, 0);
     }
 
+    pub(crate) fn mark_point_ready_without_entry_point(&self, point_id: PointOffsetType) {
+        debug_assert!(
+            !self.ready_list[point_id as usize],
+            "Point {point_id} was already marked as ready"
+        );
+        self.ready_list.set_aliased(point_id as usize, true);
+    }
+
+    pub(crate) fn mark_point_ready_as_entry_point<F>(&self, point_id: PointOffsetType, checker: F)
+    where
+        F: Fn(PointOffsetType) -> bool,
+    {
+        self.mark_point_ready_without_entry_point(point_id);
+        let level = self.get_point_level(point_id);
+        self.entry_points.lock().new_point(point_id, level, checker);
+    }
+
     /// Link `point_id` into the graph, but only build edges on layers
     /// `>= min_level`.
     ///
@@ -428,10 +482,10 @@ impl GraphLayersBuilder {
 
         let level = self.get_point_level(point_id);
 
-        // Even when `min_level > 0` we still register `point_id` as an entry
-        // point candidate so subsequent search/insertion can find it. We
-        // also still mark it ready below so concurrent insertions can
-        // traverse it. Both are required for graph connectivity.
+        // Even when `min_level > 0` we still register `point_id` as an
+        // upper-layer entry point candidate so subsequent search/insertion can
+        // find it. MIRAGE level-0-only points should use
+        // `mark_point_ready_without_entry_point` instead.
 
         let entry_point_opt = self
             .entry_points
@@ -662,6 +716,50 @@ mod tests {
     use crate::vector_storage::{DEFAULT_STOPPED, VectorStorage as _};
 
     const M: usize = 8;
+
+    #[test]
+    fn test_mark_ready_without_entry_point_does_not_register_entry_point() {
+        let builder = GraphLayersBuilder::new(3, HnswM::new2(M), 16, 10, true);
+
+        builder.mark_point_ready_without_entry_point(0);
+        builder.mark_point_ready_without_entry_point(1);
+        builder.mark_point_ready_without_entry_point(2);
+
+        assert!(
+            builder
+                .entry_points
+                .lock()
+                .get_entry_point(|_| true)
+                .is_none(),
+            "mark-ready-only points must not be registered as entry points",
+        );
+    }
+
+    #[test]
+    fn test_mark_ready_as_entry_point_registers_single_fallback() {
+        let builder = GraphLayersBuilder::new(3, HnswM::new2(M), 16, 10, true);
+
+        builder.mark_point_ready_as_entry_point(0, |_| true);
+        builder.mark_point_ready_without_entry_point(1);
+        builder.mark_point_ready_without_entry_point(2);
+
+        let entry = builder
+            .entry_points
+            .lock()
+            .get_entry_point(|_| true)
+            .expect("fallback entry point should be registered");
+        assert_eq!(entry.point_id, 0);
+        assert_eq!(entry.level, 0);
+
+        assert!(
+            builder
+                .entry_points
+                .lock()
+                .get_entry_point(|point_id| point_id == 1 || point_id == 2)
+                .is_none(),
+            "mark-ready-only points must not be registered as extra entry points",
+        );
+    }
 
     #[cfg(not(windows))]
     fn parallel_graph_build<R>(

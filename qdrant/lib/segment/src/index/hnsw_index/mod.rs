@@ -16,6 +16,8 @@ mod search_context;
 #[cfg(feature = "gpu")]
 pub mod gpu;
 
+pub(crate) use config::HnswGraphConfig;
+
 /// Maximum number of links per level.
 #[derive(Debug, Clone, Copy)]
 pub struct HnswM {

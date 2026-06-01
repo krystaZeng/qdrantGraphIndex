@@ -733,7 +733,7 @@ impl HnswConfig {
 
 /// Default refinement parameters for MIRAGE Layer 0. See
 /// [`crate::index::mirage_index::refinement_builder::RefinementParams`].
-pub const DEFAULT_MIRAGE_S: usize = 32;
+pub const DEFAULT_MIRAGE_S: usize = 16;
 pub const DEFAULT_MIRAGE_R: usize = 4;
 pub const DEFAULT_MIRAGE_ITER: usize = 15;
 pub const DEFAULT_MIRAGE_NUM_REVERSE_EDGES: usize = 96;
@@ -778,7 +778,7 @@ pub struct MirageConfig {
     pub ef_construct: usize,
 
     /// Initial out-degree of the random graph at Layer 0 (paper's `S`).
-    /// Default 32.
+    /// Default 16, matching the local C++ MIRAGE implementation.
     #[serde(default = "default_mirage_s")]
     #[validate(range(min = 4))]
     pub s: usize,
@@ -837,6 +837,23 @@ impl Default for MirageConfig {
 }
 
 impl MirageConfig {
+    pub fn from_hnsw(hnsw: HnswConfig) -> Self {
+        MirageConfig {
+            m: hnsw.m,
+            ef_construct: hnsw.ef_construct.max(1024),
+            full_scan_threshold: hnsw.full_scan_threshold,
+            max_indexing_threads: hnsw.max_indexing_threads,
+
+            // P0: Mirage is in-memory only. Do not inherit HNSW on_disk yet.
+            on_disk: Some(false),
+
+            // P0: no payload-aware subgraph / filter optimization.
+            payload_m: None,
+
+            ..Default::default()
+        }
+    }
+
     /// Returns true iff the configuration change requires a full index
     /// rebuild (versus just a reload). Mirrors
     /// [`HnswConfig::mismatch_requires_rebuild`].
@@ -4254,6 +4271,63 @@ mod tests {
         let de_record: T = rmp_serde::from_slice(&binary_entity).expect("deserialization ok");
 
         assert_eq!(record, de_record);
+    }
+
+    #[test]
+    fn test_mirage_config_from_hnsw_keeps_p0_boundaries() {
+        let hnsw = HnswConfig {
+            m: 24,
+            ef_construct: 128,
+            full_scan_threshold: 42,
+            max_indexing_threads: 3,
+            on_disk: Some(true),
+            payload_m: Some(12),
+            inline_storage: Some(true),
+        };
+
+        let mirage = MirageConfig::from_hnsw(hnsw);
+
+        assert_eq!(mirage.m, hnsw.m);
+        assert_eq!(mirage.ef_construct, 1024);
+        assert_eq!(mirage.full_scan_threshold, hnsw.full_scan_threshold);
+        assert_eq!(mirage.max_indexing_threads, hnsw.max_indexing_threads);
+        assert_eq!(mirage.on_disk, Some(false));
+        assert_eq!(mirage.payload_m, None);
+    }
+
+    #[test]
+    fn test_mirage_config_from_hnsw_preserves_high_ef_construct() {
+        let hnsw = HnswConfig {
+            m: 24,
+            ef_construct: 2048,
+            full_scan_threshold: 42,
+            max_indexing_threads: 3,
+            on_disk: Some(false),
+            payload_m: None,
+            inline_storage: None,
+        };
+
+        let mirage = MirageConfig::from_hnsw(hnsw);
+
+        assert_eq!(mirage.ef_construct, hnsw.ef_construct);
+    }
+
+    #[test]
+    fn test_mirage_config_from_hnsw_normalized_target_does_not_mismatch() {
+        let hnsw = HnswConfig {
+            m: 16,
+            ef_construct: 100,
+            full_scan_threshold: DEFAULT_FULL_SCAN_THRESHOLD,
+            max_indexing_threads: 0,
+            on_disk: None,
+            payload_m: Some(12),
+            inline_storage: None,
+        };
+
+        let effective = MirageConfig::from_hnsw(hnsw);
+        let target = MirageConfig::from_hnsw(hnsw);
+
+        assert!(!effective.mismatch_requires_rebuild(&target));
     }
 
     #[test]

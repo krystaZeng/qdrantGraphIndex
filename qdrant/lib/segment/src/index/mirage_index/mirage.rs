@@ -24,16 +24,15 @@
 //! 1. Runs the refinement pipeline ([`refinement_builder::build_layer0`])
 //!    to produce Layer 0 adjacency.
 //! 2. Sets per-point levels using HNSW's standard
-//!    `1 / ln M` exponential distribution.
-//! 3. Injects Layer 0 into a [`GraphLayersBuilder`] via
-//!    [`GraphLayersBuilder::inject_layer0_with_heuristic`].
-//! 4. Runs HNSW's [`GraphLayersBuilder::link_new_point_with_min_level`]
+//!    `1 / ln M` exponential distribution and runs HNSW's
+//!    [`GraphLayersBuilder::link_new_point_with_min_level`]
 //!    with `min_level = 1` to build the upper layers (the search-and-
 //!    connect logic is reused unmodified).
-//! 5. Persists the graph via [`GraphLayersBuilder::into_graph_layers`]
-//!    using the standard HNSW on-disk format (`graph.bin` +
-//!    `links*.bin`).
-//! 6. Saves a tiny `mirage_config.json` next to it that records the
+//! 3. Injects Layer 0 into a [`GraphLayersBuilder`] via
+//!    [`GraphLayersBuilder::inject_layer0_with_heuristic`].
+//! 4. Persists the graph files using the standard HNSW on-disk format
+//!    (`graph.bin` + `links*.bin`).
+//! 5. Saves a tiny `mirage_config.json` next to it that records the
 //!    MIRAGE-specific build parameters (so future opens / config-mismatch
 //!    detection know what was built).
 //!
@@ -45,8 +44,9 @@
 use std::ops::Deref as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use atomic_refcell::AtomicRefCell;
 use common::bitvec::BitSlice;
@@ -59,25 +59,25 @@ use rayon::ThreadPool;
 use rayon::prelude::*;
 
 use super::config::MirageGraphConfig;
-use super::refinement_builder::{self, RefinementParams};
-use crate::common::operation_error::{OperationResult, check_process_stopped};
+use super::faiss_random::{FaissMt19937, faiss_random_level, faiss_shuffle};
+use super::refinement_builder::{self, PairScorer, RefinementParams};
+use crate::common::operation_error::{OperationError, OperationResult, check_process_stopped};
 use crate::data_types::query_context::VectorQueryContext;
 use crate::data_types::vectors::{QueryVector, VectorRef};
 use crate::id_tracker::{IdTracker, IdTrackerEnum};
 use crate::index::VectorIndex;
-use crate::index::hnsw_index::HnswM;
-use crate::index::hnsw_index::config::HnswGraphConfig;
 use crate::index::hnsw_index::graph_layers::GraphLayers;
 use crate::index::hnsw_index::graph_layers_builder::GraphLayersBuilder;
 use crate::index::hnsw_index::graph_links::GraphLinksFormatParam;
 use crate::index::hnsw_index::hnsw::{HNSWIndex, HnswIndexOpenArgs};
 use crate::index::hnsw_index::point_scorer::FilteredScorer;
+use crate::index::hnsw_index::{HnswGraphConfig, HnswM};
 use crate::index::struct_payload_index::StructPayloadIndex;
 use crate::segment_constructor::VectorIndexBuildArgs;
 use crate::telemetry::VectorIndexSearchesTelemetry;
-use crate::types::{Filter, MirageConfig, SearchParams};
-use crate::vector_storage::VectorStorageEnum;
+use crate::types::{Filter, MirageConfig, SearchParams, VectorStorageDatatype};
 use crate::vector_storage::quantized::quantized_vectors::QuantizedVectors;
+use crate::vector_storage::{VectorStorage, VectorStorageEnum};
 
 /// Use the same RNG-based heuristic neighbor selection as HNSW.
 ///
@@ -86,15 +86,44 @@ use crate::vector_storage::quantized::quantized_vectors::QuantizedVectors;
 /// `shrink_neighbor_list`), we always enable it.
 const MIRAGE_USE_HEURISTIC: bool = true;
 
-/// Below this many points, build sequentially to ensure connectivity.
-/// Mirrors HNSW's `SINGLE_THREADED_HNSW_BUILD_THRESHOLD`.
-#[cfg(debug_assertions)]
-const SINGLE_THREADED_MIRAGE_BUILD_THRESHOLD: usize = 32;
-#[cfg(not(debug_assertions))]
-const SINGLE_THREADED_MIRAGE_BUILD_THRESHOLD: usize = 256;
-
 /// Bytes-in-KB constant used for `full_scan_threshold` conversion.
 const BYTES_IN_KB: usize = 1024;
+
+#[derive(Debug, Default, Clone, Copy)]
+struct MirageBuildTimings {
+    refine_layer0: Duration,
+    build_upper_layers: Duration,
+    inject_layer0: Duration,
+    materialize_graph: Duration,
+    persist_graph: Duration,
+    persist_config: Duration,
+    open_runtime: Duration,
+    total: Duration,
+}
+
+impl MirageBuildTimings {
+    fn algorithm_build(&self) -> Duration {
+        self.refine_layer0 + self.build_upper_layers + self.inject_layer0
+    }
+
+    fn runtime_build(&self) -> Duration {
+        self.algorithm_build() + self.materialize_graph
+    }
+}
+
+fn duration_ms(duration: Duration) -> f64 {
+    duration.as_secs_f64() * 1_000.0
+}
+
+struct MirageInternalPairScorer<'a> {
+    scorer: FilteredScorer<'a>,
+}
+
+impl PairScorer for MirageInternalPairScorer<'_> {
+    fn score_pair(&mut self, a: PointOffsetType, b: PointOffsetType) -> ScoreType {
+        self.scorer.score_internal(a, b)
+    }
+}
 
 /// MIRAGE-flavored vector index.
 ///
@@ -126,12 +155,92 @@ pub struct MirageIndexOpenArgs<'a> {
 }
 
 impl MirageIndex {
+    fn validate_p0_config(mirage_config: &MirageConfig) -> OperationResult<()> {
+        if mirage_config.on_disk == Some(true) {
+            return Err(OperationError::validation_error(
+                "Mirage P0 does not support on-disk Mirage index",
+            ));
+        }
+
+        if mirage_config.payload_m.is_some() {
+            return Err(OperationError::validation_error(
+                "Mirage P0 does not support payload-aware subgraphs",
+            ));
+        }
+
+        Ok(())
+    }
+
+    fn validate_p0_runtime(
+        mirage_config: &MirageConfig,
+        vector_storage: &VectorStorageEnum,
+        quantized_vectors: &Option<QuantizedVectors>,
+    ) -> OperationResult<()> {
+        Self::validate_p0_config(mirage_config)?;
+
+        if quantized_vectors.is_some() {
+            return Err(OperationError::validation_error(
+                "Mirage P0 does not support quantization",
+            ));
+        }
+
+        if vector_storage.try_multi_vector_config().is_some() {
+            return Err(OperationError::validation_error(
+                "Mirage P0 does not support multi-vector storage",
+            ));
+        }
+
+        if vector_storage.is_on_disk() {
+            return Err(OperationError::validation_error(
+                "Mirage P0 does not support on-disk vector storage",
+            ));
+        }
+
+        if vector_storage.datatype() != VectorStorageDatatype::Float32 {
+            return Err(OperationError::validation_error(
+                "Mirage P0 supports Float32 vector storage only",
+            ));
+        }
+
+        match vector_storage {
+            #[cfg(feature = "rocksdb")]
+            VectorStorageEnum::DenseSimple(_) => Ok(()),
+            VectorStorageEnum::DenseVolatile(_) => Ok(()),
+            VectorStorageEnum::DenseAppendableMemmap(_) => Ok(()),
+            _ => Err(OperationError::validation_error(
+                "Mirage P0 supports dense Float32 vector storage only",
+            )),
+        }
+    }
+
+    fn validate_p0_open_args(args: &MirageIndexOpenArgs<'_>) -> OperationResult<()> {
+        let vector_storage_ref = args.vector_storage.borrow();
+        let quantized_vectors_ref = args.quantized_vectors.borrow();
+        Self::validate_p0_runtime(
+            &args.mirage_config,
+            &vector_storage_ref,
+            &quantized_vectors_ref,
+        )
+    }
+
+    fn validate_p0_search(filter: Option<&Filter>) -> OperationResult<()> {
+        if filter.is_some() {
+            return Err(OperationError::validation_error(
+                "Mirage P0 supports no-filter search only",
+            ));
+        }
+
+        Ok(())
+    }
+
     /// Open an existing MIRAGE index from disk.
     ///
     /// If `mirage_config.json` is missing (e.g. the segment was built by
     /// HNSW and only later configured to use MIRAGE), falls back to
     /// constructing a fresh [`MirageGraphConfig`] from `args.mirage_config`.
     pub fn open(args: MirageIndexOpenArgs<'_>) -> OperationResult<Self> {
+        Self::validate_p0_open_args(&args)?;
+
         let MirageIndexOpenArgs {
             path,
             id_tracker,
@@ -176,6 +285,8 @@ impl MirageIndex {
         open_args: MirageIndexOpenArgs<'_>,
         build_args: VectorIndexBuildArgs<'_, R>,
     ) -> OperationResult<Self> {
+        Self::validate_p0_open_args(&open_args)?;
+
         // Don't allow rebuilding over an already-built index. Mirror HNSW.
         if MirageGraphConfig::get_config_path(open_args.path).exists()
             || HnswGraphConfig::get_config_path(open_args.path).exists()
@@ -208,6 +319,9 @@ impl MirageIndex {
             progress: _,
         } = build_args;
 
+        let total_timer = Instant::now();
+        let mut timings = MirageBuildTimings::default();
+
         fs::create_dir_all(path)?;
 
         let id_tracker_ref = id_tracker.borrow();
@@ -231,7 +345,7 @@ impl MirageIndex {
 
         let mut config = MirageGraphConfig::new(
             mirage_config.m,
-            mirage_config.ef_construct,
+            mirage_config.ef_construct.max(1024),
             full_scan_threshold,
             mirage_config.s,
             mirage_config.r,
@@ -274,7 +388,7 @@ impl MirageIndex {
 
         // -------- Build the graph. --------
         let mut indexed_vectors = 0;
-        let graph_layers_builder = if build_main_graph {
+        let (graph_layers_builder, graph_timings) = if build_main_graph {
             Self::build_main_graph(
                 &pool,
                 &config,
@@ -290,14 +404,20 @@ impl MirageIndex {
             // Empty builder: behaves like a Plain index, but with the
             // MIRAGE config saved so future opens don't try to reinterpret
             // the segment.
-            GraphLayersBuilder::new(
-                total_vector_count,
-                HnswM::new(0, 0),
-                config.ef_construct,
-                1,
-                MIRAGE_USE_HEURISTIC,
+            (
+                GraphLayersBuilder::new(
+                    total_vector_count,
+                    HnswM::new(0, 0),
+                    config.ef_construct,
+                    1,
+                    MIRAGE_USE_HEURISTIC,
+                ),
+                MirageBuildTimings::default(),
             )
         };
+        timings.refine_layer0 = graph_timings.refine_layer0;
+        timings.build_upper_layers = graph_timings.build_upper_layers;
+        timings.inject_layer0 = graph_timings.inject_layer0;
 
         config.indexed_vector_count = Some(indexed_vectors);
 
@@ -306,19 +426,21 @@ impl MirageIndex {
         // compressed format on disk and plain in RAM.
         let format_param = GraphLinksFormatParam::Compressed;
 
-        // Always save graph to disk (we'll mmap it back on open). Mirror
-        // HNSW's behavior of using `is_on_disk = true` during build to
-        // avoid keeping the throw-away builder graph in RAM.
-        let graph_layers: GraphLayers =
-            graph_layers_builder.into_graph_layers(path, format_param, true)?;
-        // We don't need the in-memory graph; HNSWIndex::open will mmap the
-        // on-disk version below.
-        drop(graph_layers);
+        // Persist graph files without immediately mmap-loading them back.
+        // `HNSWIndex::open` below is the runtime load step we report
+        // separately.
+        let persist_timings = graph_layers_builder.persist_graph_layers(path, format_param)?;
+        timings.materialize_graph = persist_timings.materialize_graph;
+        timings.persist_graph = persist_timings.persist_graph;
 
         // Save the HNSW-compat config so the inner HNSWIndex can find it.
-        config.to_hnsw_compat().save(&HnswGraphConfig::get_config_path(path))?;
+        let timer = Instant::now();
+        config
+            .to_hnsw_compat()
+            .save(&HnswGraphConfig::get_config_path(path))?;
         // Save MIRAGE-specific config alongside.
         config.save(&MirageGraphConfig::get_config_path(path))?;
+        timings.persist_config = timer.elapsed();
 
         debug!(
             "MIRAGE build done: {indexed_vectors} indexed, S={s}, R={r}, iter={it}",
@@ -334,6 +456,7 @@ impl MirageIndex {
 
         // Now hand off to HNSW's open path which will mmap the on-disk
         // graph and wire up scorers / telemetry / quantization.
+        let timer = Instant::now();
         let inner = HNSWIndex::open(HnswIndexOpenArgs {
             path,
             id_tracker,
@@ -342,6 +465,45 @@ impl MirageIndex {
             payload_index,
             hnsw_config: mirage_config.to_hnsw_compat(),
         })?;
+        timings.open_runtime = timer.elapsed();
+        timings.total = total_timer.elapsed();
+
+        let cpp_parity_eligible =
+            refinement_builder::cpp_parity_eligible(indexed_vectors, config.s);
+        let recall_acceptance_eligible =
+            refinement_builder::recall_acceptance_eligible(indexed_vectors, config.s);
+        let boundary_behavior = if cpp_parity_eligible {
+            "mirage_cpp_random_graph"
+        } else {
+            "qdrant_complete_graph"
+        };
+        let metric_scope = if recall_acceptance_eligible {
+            "recall_build"
+        } else {
+            "correctness_only"
+        };
+
+        if !cpp_parity_eligible {
+            log::info!(
+                "MIRAGE uses Qdrant small-N boundary behavior: n_alive={indexed_vectors}, S={s}, boundary_behavior={boundary_behavior}, cpp_parity=false, metric_scope=correctness_only",
+                s = config.s,
+            );
+        }
+
+        log::info!(
+            "MIRAGE build timings: n_alive={indexed_vectors}, S={s}, boundary_behavior={boundary_behavior}, cpp_parity_eligible={cpp_parity_eligible}, recall_acceptance_eligible={recall_acceptance_eligible}, metric_scope={metric_scope}, algorithm_build_ms={algorithm:.3}, runtime_build_ms={runtime:.3}, refine_layer0_ms={refine:.3}, build_upper_layers_ms={upper:.3}, inject_layer0_ms={inject:.3}, materialize_graph_ms={materialize:.3}, persist_graph_ms={persist_graph:.3}, persist_config_ms={persist_config:.3}, open_runtime_ms={open:.3}, total_ms={total:.3}",
+            s = config.s,
+            algorithm = duration_ms(timings.algorithm_build()),
+            runtime = duration_ms(timings.runtime_build()),
+            refine = duration_ms(timings.refine_layer0),
+            upper = duration_ms(timings.build_upper_layers),
+            inject = duration_ms(timings.inject_layer0),
+            materialize = duration_ms(timings.materialize_graph),
+            persist_graph = duration_ms(timings.persist_graph),
+            persist_config = duration_ms(timings.persist_config),
+            open = duration_ms(timings.open_runtime),
+            total = duration_ms(timings.total),
+        );
 
         Ok(MirageIndex {
             inner,
@@ -358,13 +520,14 @@ impl MirageIndex {
         pool: &ThreadPool,
         config: &MirageGraphConfig,
         stopped: &AtomicBool,
-        rng: &mut R,
+        _rng: &mut R,
         id_tracker_ref: &IdTrackerEnum,
         vector_storage_ref: &VectorStorageEnum,
         quantized_vectors_ref: &Option<QuantizedVectors>,
         deleted_bitslice: &common::bitvec::BitSlice,
         indexed_vectors: &mut usize,
-    ) -> OperationResult<GraphLayersBuilder> {
+    ) -> OperationResult<(GraphLayersBuilder, MirageBuildTimings)> {
+        let mut timings = MirageBuildTimings::default();
         let total_vector_count = vector_storage_ref.total_vector_count();
 
         let entry_points_num = std::cmp::max(
@@ -372,7 +535,7 @@ impl MirageIndex {
             total_vector_count
                 .checked_div(config.full_scan_threshold.max(1))
                 .unwrap_or(0)
-                * 10,
+                .saturating_mul(10),
         );
 
         let mut builder = GraphLayersBuilder::new(
@@ -383,17 +546,15 @@ impl MirageIndex {
             MIRAGE_USE_HEURISTIC,
         );
 
-        // 1) Assign random levels for *all* live points. Same distribution
-        //    as HNSW (1/ln M). Done in single-threaded order so subsequent
-        //    parallel build sees a stable level table.
+        // 1) Collect live points in internal-id order. MIRAGE's C++ source
+        //    operates on a dense `0..ntotal` table; the refinement builder
+        //    maps this list to dense logical ids internally.
         let mut alive_ids: Vec<PointOffsetType> = Vec::with_capacity(total_vector_count);
         for pid in id_tracker_ref
             .point_mappings()
             .iter_internal_excluding(deleted_bitslice)
         {
             *indexed_vectors += 1;
-            let level = builder.get_random_layer(rng);
-            builder.set_levels(pid, level);
             alive_ids.push(pid);
         }
         debug!("MIRAGE: {} alive points", alive_ids.len());
@@ -404,23 +565,22 @@ impl MirageIndex {
         // empty graph below.
         if alive_ids.is_empty() {
             debug!("MIRAGE: no live points to index, returning empty builder");
-            return Ok(builder);
+            return Ok((builder, timings));
         }
 
         // 2) Build Layer 0 adjacency lists via refinement.
         //
-        //    `score_pair` is built on top of `RawScorer::score_internal`,
-        //    which is symmetric and query-independent. For Phase 1
-        //    simplicity we construct a fresh scorer per call — fine for
-        //    correctness, but does add a malloc per pairwise distance.
-        //    A follow-up should add a per-thread scorer cache (see
-        //    `rayon::ThreadLocal` or a `crossbeam::sync::ShardedLock`).
+        //    Pairwise scores are built on top of `RawScorer::score_internal`,
+        //    which is symmetric and query-independent. The factory below is
+        //    called once per refinement worker chunk, so the expensive
+        //    `FilteredScorer` setup is amortized over many distance calls.
         //
         //    Lifetime/Send story: `vector_storage_ref`, `quantized_vectors_ref`
         //    and `point_deleted` are borrowed for the duration of this
         //    function; they are `Sync`, so `&T` is `Send`, and the closure
         //    we hand to rayon is therefore `Send + Sync`.
         let layer0_adj = {
+            let timer = Instant::now();
             // Safe due to the early-return above.
             let entry_pid = alive_ids[0];
 
@@ -431,8 +591,8 @@ impl MirageIndex {
             let alive_set: std::collections::HashSet<PointOffsetType> =
                 alive_ids.iter().copied().collect();
 
-            let score_pair = |a: PointOffsetType, b: PointOffsetType| -> ScoreType {
-                let scorer = FilteredScorer::new_internal(
+            let make_scorer = || {
+                FilteredScorer::new_internal(
                     entry_pid,
                     storage_ref,
                     qv_ref,
@@ -440,8 +600,7 @@ impl MirageIndex {
                     point_deleted,
                     HardwareCounterCell::disposable(),
                 )
-                .expect("MIRAGE: failed to build internal scorer");
-                scorer.score_internal(a, b)
+                .map(|scorer| MirageInternalPairScorer { scorer })
             };
 
             let is_alive = |pid: PointOffsetType| -> bool { alive_set.contains(&pid) };
@@ -454,56 +613,37 @@ impl MirageIndex {
                 seed: 2021,
             };
 
-            refinement_builder::build_layer0(
+            let layer0 = refinement_builder::build_layer0(
                 total_vector_count,
                 &params,
                 pool,
                 is_alive,
-                score_pair,
+                make_scorer,
                 stopped,
-            )?
+            )?;
+            timings.refine_layer0 = timer.elapsed();
+            layer0
         };
 
-        // 3) Inject Layer 0 (RNG-prune to m0 slots).
-        //
-        //    We rebuild a fresh FilteredScorer per call here too, for the
-        //    same reason as above. Performance of this phase is dominated
-        //    by the heuristic itself, not scorer construction; it can be
-        //    optimized later with a per-thread scorer cache.
+        // 3) Assign FAISS-compatible random levels and build upper layers in
+        //    the same order as `IndexMIRAGE::add_levels`: bucket by level,
+        //    walk from the highest level down to 1, and shuffle each bucket
+        //    with seed 789 before insertion. Layer-0-only points are marked
+        //    ready afterwards; this is a Qdrant runtime requirement so the
+        //    injected layer 0 can be traversed during search.
         check_process_stopped(stopped)?;
-        pool.install(|| -> OperationResult<()> {
-            (0..total_vector_count)
-                .into_par_iter()
-                .try_for_each(|u| -> OperationResult<()> {
-                    if u % 4096 == 0 {
-                        check_process_stopped(stopped)?;
-                    }
-                    let nbrs = &layer0_adj[u];
-                    if nbrs.is_empty() {
-                        return Ok(());
-                    }
-                    let pid = u as PointOffsetType;
-                    let scorer = FilteredScorer::new_internal(
-                        pid,
-                        vector_storage_ref,
-                        quantized_vectors_ref.as_ref(),
-                        None,
-                        id_tracker_ref.deleted_point_bitslice(),
-                        HardwareCounterCell::disposable(),
-                    )?;
-                    builder.inject_layer0_with_heuristic(
-                        pid,
-                        nbrs.iter().copied(),
-                        |a, b| scorer.score_internal(a, b),
-                    );
-                    Ok(())
-                })?;
-            Ok(())
-        })?;
+        let timer = Instant::now();
+        let mut level_rng = FaissMt19937::new(12345);
+        let mut level_buckets: Vec<Vec<PointOffsetType>> = vec![Vec::new()];
+        for &pid in &alive_ids {
+            let level = faiss_random_level(config.m, &mut level_rng);
+            builder.set_levels(pid, level);
+            if level_buckets.len() <= level {
+                level_buckets.resize_with(level + 1, Vec::new);
+            }
+            level_buckets[level].push(pid);
+        }
 
-        // 4) Build upper layers (levels >= 1) with HNSW's standard
-        //    search-and-connect.
-        check_process_stopped(stopped)?;
         let counter = std::sync::atomic::AtomicU64::new(0);
         let insert_upper = |pid: PointOffsetType| -> OperationResult<()> {
             check_process_stopped(stopped)?;
@@ -516,32 +656,127 @@ impl MirageIndex {
                 HardwareCounterCell::disposable(),
             )?;
             builder.link_new_point_with_min_level(pid, scorer, 1);
-            counter.fetch_add(1, Ordering::Relaxed);
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Ok(())
         };
 
-        // Single-threaded warmup, then parallel for the rest, mirroring
-        // HNSW's pattern to avoid disconnections in the early entry-point
-        // graph.
-        let n_warmup = SINGLE_THREADED_MIRAGE_BUILD_THRESHOLD.min(alive_ids.len());
-        for &pid in alive_ids[..n_warmup].iter() {
-            insert_upper(pid)?;
+        let mut shuffle_rng = FaissMt19937::new(789);
+        let mut has_entry_point = false;
+        for level in (1..level_buckets.len()).rev() {
+            check_process_stopped(stopped)?;
+            let bucket = &mut level_buckets[level];
+            faiss_shuffle(bucket, &mut shuffle_rng);
+            if bucket.is_empty() {
+                continue;
+            }
+
+            let rest = if has_entry_point {
+                bucket.as_slice()
+            } else {
+                insert_upper(bucket[0])?;
+                has_entry_point = true;
+                &bucket[1..]
+            };
+
+            if rest.len() > 100 {
+                pool.install(|| -> OperationResult<()> {
+                    rest.par_iter().try_for_each(|&pid| insert_upper(pid))
+                })?;
+            } else {
+                for &pid in rest {
+                    insert_upper(pid)?;
+                }
+            }
         }
-        if alive_ids.len() > n_warmup {
-            pool.install(|| -> OperationResult<()> {
-                alive_ids[n_warmup..]
-                    .par_iter()
-                    .try_for_each(|&pid| insert_upper(pid))
-            })?;
+
+        // Mark level-0-only points ready after upper layers are complete
+        // without registering all of them as entry points. If there was no
+        // upper-layer point at all, register exactly one deterministic
+        // fallback entry point so HNSW search has an entry into Layer 0.
+        let level0 = &level_buckets[0];
+        if has_entry_point {
+            if level0.len() > 100 {
+                pool.install(|| -> OperationResult<()> {
+                    level0.par_iter().try_for_each(|&pid| {
+                        if pid as usize % 4096 == 0 {
+                            check_process_stopped(stopped)?;
+                        }
+                        builder.mark_point_ready_without_entry_point(pid);
+                        Ok(())
+                    })
+                })?;
+            } else {
+                for &pid in level0 {
+                    check_process_stopped(stopped)?;
+                    builder.mark_point_ready_without_entry_point(pid);
+                }
+            }
+        } else if let Some((&fallback, rest)) = level0.split_first() {
+            check_process_stopped(stopped)?;
+            builder.mark_point_ready_as_entry_point(fallback, |_| true);
+            has_entry_point = true;
+
+            if rest.len() > 100 {
+                pool.install(|| -> OperationResult<()> {
+                    rest.par_iter().try_for_each(|&pid| {
+                        if pid as usize % 4096 == 0 {
+                            check_process_stopped(stopped)?;
+                        }
+                        builder.mark_point_ready_without_entry_point(pid);
+                        Ok(())
+                    })
+                })?;
+            } else {
+                for &pid in rest {
+                    check_process_stopped(stopped)?;
+                    builder.mark_point_ready_without_entry_point(pid);
+                }
+            }
         }
+        debug_assert!(has_entry_point);
+        timings.build_upper_layers = timer.elapsed();
+
+        // 4) Inject Layer 0 (RNG-prune to m0 slots). C++ converts Mirage to
+        //    HNSW with `k = mirage.S`, so we only feed the first S candidates.
+        check_process_stopped(stopped)?;
+        let timer = Instant::now();
+        pool.install(|| -> OperationResult<()> {
+            alive_ids
+                .par_iter()
+                .try_for_each(|&pid| -> OperationResult<()> {
+                    if pid as usize % 4096 == 0 {
+                        check_process_stopped(stopped)?;
+                    }
+                    let nbrs = &layer0_adj[pid as usize];
+                    if nbrs.is_empty() {
+                        return Ok(());
+                    }
+                    let scorer = FilteredScorer::new_internal(
+                        pid,
+                        vector_storage_ref,
+                        quantized_vectors_ref.as_ref(),
+                        None,
+                        id_tracker_ref.deleted_point_bitslice(),
+                        HardwareCounterCell::disposable(),
+                    )?;
+                    builder.inject_layer0_with_heuristic(
+                        pid,
+                        nbrs.iter().copied().take(config.s),
+                        |a, b| scorer.score_internal(a, b),
+                    );
+                    Ok(())
+                })?;
+            Ok(())
+        })?;
+        timings.inject_layer0 = timer.elapsed();
 
         debug!(
             "MIRAGE: built {} upper-layer entries in {:?}",
-            counter.load(Ordering::Relaxed),
-            std::time::Instant::now()
+            counter.load(std::sync::atomic::Ordering::Relaxed),
+            timings.build_upper_layers,
         );
 
-        Ok(builder)
+        Ok((builder, timings))
     }
 
     /// Construct a [`MirageGraphConfig`] from user-facing config when no
@@ -565,7 +800,7 @@ impl MirageIndex {
             .unwrap_or(1);
         MirageGraphConfig::new(
             user_cfg.m,
-            user_cfg.ef_construct,
+            user_cfg.ef_construct.max(1024),
             full_scan_threshold,
             user_cfg.s,
             user_cfg.r,
@@ -603,7 +838,7 @@ impl MirageConfig {
     pub fn to_hnsw_compat(&self) -> crate::types::HnswConfig {
         crate::types::HnswConfig {
             m: self.m,
-            ef_construct: self.ef_construct,
+            ef_construct: self.ef_construct.max(1024),
             full_scan_threshold: self.full_scan_threshold,
             max_indexing_threads: self.max_indexing_threads,
             on_disk: self.on_disk,
@@ -622,9 +857,12 @@ impl VectorIndex for MirageIndex {
         params: Option<&SearchParams>,
         query_context: &VectorQueryContext,
     ) -> OperationResult<Vec<Vec<ScoredPointOffset>>> {
+        Self::validate_p0_search(filter)?;
+
         // Search delegates verbatim to HNSW. The MIRAGE-built graph is a
         // valid HNSW graph, so this is sound.
-        self.inner.search(vectors, filter, top, params, query_context)
+        self.inner
+            .search(vectors, filter, top, params, query_context)
     }
 
     fn get_telemetry_data(&self, detail: TelemetryDetail) -> VectorIndexSearchesTelemetry {
@@ -667,5 +905,55 @@ impl VectorIndex for MirageIndex {
         // The optimizer will rebuild the segment when versions advance.
         // (HNSW also returns an error here.)
         self.inner.update_vector(id, vector, hw_counter)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn expect_validation_error(result: OperationResult<()>, expected: &str) {
+        let err = result.unwrap_err();
+        assert!(matches!(
+            err,
+            OperationError::ValidationError { description } if description == expected
+        ));
+    }
+
+    #[test]
+    fn test_validate_p0_config_rejects_on_disk_index() {
+        let config = MirageConfig {
+            on_disk: Some(true),
+            ..Default::default()
+        };
+
+        expect_validation_error(
+            MirageIndex::validate_p0_config(&config),
+            "Mirage P0 does not support on-disk Mirage index",
+        );
+    }
+
+    #[test]
+    fn test_validate_p0_config_rejects_payload_subgraph() {
+        let config = MirageConfig {
+            payload_m: Some(16),
+            ..Default::default()
+        };
+
+        expect_validation_error(
+            MirageIndex::validate_p0_config(&config),
+            "Mirage P0 does not support payload-aware subgraphs",
+        );
+    }
+
+    #[test]
+    fn test_validate_p0_search_rejects_filter() {
+        let filter = Filter::default();
+
+        MirageIndex::validate_p0_search(None).unwrap();
+        expect_validation_error(
+            MirageIndex::validate_p0_search(Some(&filter)),
+            "Mirage P0 supports no-filter search only",
+        );
     }
 }
