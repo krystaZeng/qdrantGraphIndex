@@ -761,7 +761,7 @@ const fn default_mirage_num_reverse_edges() -> usize {
 /// in [`HnswConfig`]. The MIRAGE-specific fields (`s`, `r`, `iter`,
 /// `num_reverse_edges`) control the refinement pipeline.
 #[derive(
-    Copy, Clone, Debug, Eq, PartialEq, Deserialize, Serialize, JsonSchema, Validate, Anonymize,
+    Copy, Clone, Debug, Eq, PartialEq, Hash, Deserialize, Serialize, JsonSchema, Validate, Anonymize,
 )]
 #[serde(rename_all = "snake_case")]
 #[anonymize(false)]

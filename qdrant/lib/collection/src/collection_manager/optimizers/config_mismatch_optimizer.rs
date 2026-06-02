@@ -45,6 +45,7 @@ mod tests {
                     .unwrap_or(DenseVectorOptimizerConfig {
                         on_disk: None,
                         hnsw_config: HnswConfig::default(),
+                        mirage_config: None,
                         quantization_config: None,
                     });
                 (name.clone(), cfg)
@@ -135,6 +136,7 @@ mod tests {
             DenseVectorOptimizerConfig {
                 on_disk: None,
                 hnsw_config,
+                mirage_config: None,
                 quantization_config: None,
             },
         );
@@ -182,6 +184,7 @@ mod tests {
             DenseVectorOptimizerConfig {
                 on_disk: None,
                 hnsw_config: changed_hnsw_config,
+                mirage_config: None,
                 quantization_config: None,
             },
         );
@@ -288,6 +291,7 @@ mod tests {
             DenseVectorOptimizerConfig {
                 on_disk: Some(true),
                 hnsw_config: hnsw_config_vector1,
+                mirage_config: None,
                 quantization_config: None,
             },
         );
@@ -296,6 +300,7 @@ mod tests {
             DenseVectorOptimizerConfig {
                 on_disk: None,
                 hnsw_config: hnsw_config_vector2,
+                mirage_config: None,
                 quantization_config: None,
             },
         );
@@ -342,6 +347,7 @@ mod tests {
             DenseVectorOptimizerConfig {
                 on_disk: None,
                 hnsw_config: hnsw_config_vector2_changed,
+                mirage_config: None,
                 quantization_config: None,
             },
         );
@@ -453,6 +459,7 @@ mod tests {
             DenseVectorOptimizerConfig {
                 on_disk: None,
                 hnsw_config: HnswConfig::default(),
+                mirage_config: None,
                 quantization_config: Some(quantization_config_vector1.clone()),
             },
         );
@@ -461,6 +468,7 @@ mod tests {
             DenseVectorOptimizerConfig {
                 on_disk: None,
                 hnsw_config: HnswConfig::default(),
+                mirage_config: None,
                 quantization_config: Some(quantization_config_collection.clone()),
             },
         );
@@ -510,6 +518,7 @@ mod tests {
             DenseVectorOptimizerConfig {
                 on_disk: None,
                 hnsw_config: HnswConfig::default(),
+                mirage_config: None,
                 quantization_config: Some(quantization_config_vector2.clone()),
             },
         );

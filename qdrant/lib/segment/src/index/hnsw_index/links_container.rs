@@ -261,6 +261,10 @@ mod tests {
     use super::*;
     use crate::data_types::vectors::DenseVector;
     use crate::fixtures::index_fixtures::{TestRawScorerProducer, random_vector};
+    use crate::index::mirage_index::golden::{
+        assert_stats_match, compute_layer0_stats, generate_vectors, l2_score,
+        load_cpp_golden_n64_d8_l2, scored_top_s_candidates,
+    };
     use crate::types::Distance;
 
     #[test]
@@ -306,6 +310,36 @@ mod tests {
         for x in selected_candidates.iter() {
             eprintln!("selected_candidates = {x}");
         }
+    }
+
+    #[test]
+    fn test_layer0_injection_heuristic_matches_cpp_golden() {
+        let fixture = load_cpp_golden_n64_d8_l2();
+        let vectors = generate_vectors(&fixture);
+        let mut actual_graph = Vec::with_capacity(fixture.n);
+
+        for point_id in 0..fixture.n {
+            let candidates = scored_top_s_candidates(&fixture, &vectors, point_id);
+            let mut links_container = LinksContainer::with_capacity(fixture.params.hnsw_m0);
+
+            links_container.fill_from_sorted_with_heuristic(
+                candidates.into_iter(),
+                fixture.params.hnsw_m0,
+                |a, b| l2_score(&vectors, a as usize, b as usize),
+            );
+
+            let actual: Vec<usize> = links_container
+                .links()
+                .iter()
+                .map(|&idx| idx as usize)
+                .collect();
+
+            assert_eq!(actual, fixture.layer0_injected[point_id]);
+            actual_graph.push(actual);
+        }
+
+        let actual_stats = compute_layer0_stats(&actual_graph);
+        assert_stats_match(&actual_stats, &fixture.layer0_injected_stats);
     }
 
     #[test]

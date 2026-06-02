@@ -319,6 +319,12 @@ fn validate_mirage_p0_vector_config(vector_config: &VectorDataConfig) -> Operati
         return Ok(());
     };
 
+    if vector_config.distance != Distance::Euclid {
+        return Err(OperationError::validation_error(
+            "Mirage P0 supports Euclid distance only",
+        ));
+    }
+
     if vector_config.multivector_config.is_some() {
         return Err(OperationError::validation_error(
             "Mirage P0 does not support multi-vector storage",
@@ -1698,7 +1704,7 @@ mod tests {
     fn mirage_vector_config() -> VectorDataConfig {
         VectorDataConfig {
             size: 4,
-            distance: Distance::Dot,
+            distance: Distance::Euclid,
             storage_type: VectorStorageType::InRamChunkedMmap,
             index: Indexes::Mirage(MirageConfig::default()),
             quantization_config: None,
@@ -1733,6 +1739,14 @@ mod tests {
         let mut config = mirage_vector_config();
         config.datatype = Some(VectorStorageDatatype::Float32);
         validate_mirage_p0_vector_config(&config).unwrap();
+    }
+
+    #[test]
+    fn test_validate_mirage_p0_rejects_non_euclid_distance() {
+        let mut config = mirage_vector_config();
+        config.distance = Distance::Dot;
+
+        expect_mirage_p0_validation_error(&config, "Mirage P0 supports Euclid distance only");
     }
 
     #[test]

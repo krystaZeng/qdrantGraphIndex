@@ -24,7 +24,8 @@ use wal::WalOptions;
 use crate::operations::config_diff::{DiffConfig, QuantizationConfigDiff};
 use crate::operations::types::{
     CollectionError, CollectionResult, CollectionWarning, Datatype, SparseVectorParams,
-    SparseVectorsConfig, VectorParams, VectorParamsDiff, VectorsConfig, VectorsConfigDiff,
+    SparseVectorsConfig, VectorIndexConfig, VectorParams, VectorParamsDiff, VectorsConfig,
+    VectorsConfigDiff,
 };
 use crate::operations::validation;
 use crate::optimizers_builder::OptimizersConfig;
@@ -220,7 +221,11 @@ impl CollectionParams {
             .filter_map(|(_name, params)| {
                 // Merge HNSW config with vector config to get effective HNSW config for the vector.
                 let effective_hnsw = hnsw_config.update_opt(params.hnsw_config.as_ref());
-                (effective_hnsw.m > 0 || effective_hnsw.payload_m.unwrap_or_default() > 0)
+                let explicit_mirage =
+                    matches!(params.index.as_ref(), Some(VectorIndexConfig::Mirage(_)));
+                (explicit_mirage
+                    || effective_hnsw.m > 0
+                    || effective_hnsw.payload_m.unwrap_or_default() > 0)
                     .then_some(params)
             })
             .map(|params| {
@@ -588,6 +593,7 @@ impl CollectionParams {
                     size,
                     distance,
                     hnsw_config: _,
+                    index: _,
                     quantization_config,
                     on_disk,
                     datatype,

@@ -25,7 +25,7 @@ use crate::collection_manager::optimizers::merge_optimizer::MergeOptimizer;
 use crate::collection_manager::optimizers::vacuum_optimizer::VacuumOptimizer;
 use crate::config::CollectionParams;
 use crate::operations::config_diff::DiffConfig;
-use crate::operations::types::{SparseVectorParams, VectorParams};
+use crate::operations::types::{SparseVectorParams, VectorIndexConfig, VectorParams};
 use crate::update_handler::Optimizer;
 
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, Anonymize, Clone, PartialEq)]
@@ -194,6 +194,7 @@ pub fn build_segment_optimizer_config(
                 size,
                 distance,
                 hnsw_config,
+                index,
                 quantization_config,
                 on_disk,
                 datatype,
@@ -207,6 +208,9 @@ pub fn build_segment_optimizer_config(
                     distance: *distance,
                     on_disk: *on_disk,
                     hnsw_config: global_hnsw_config.update_opt(hnsw_config.as_ref()),
+                    mirage_config: index.as_ref().map(|index| match index {
+                        VectorIndexConfig::Mirage(config) => *config,
+                    }),
                     quantization_config: quantization_config
                         .as_ref()
                         .or(global_quantization_config.as_ref())
@@ -307,4 +311,61 @@ pub fn build_optimizers(
             hnsw_global_config.clone(),
         )),
     ])
+}
+
+#[cfg(test)]
+mod tests {
+    use std::num::NonZeroU32;
+
+    use segment::data_types::vectors::DEFAULT_VECTOR_NAME;
+    use segment::types::{Distance, Indexes, MirageConfig};
+
+    use super::*;
+    use crate::operations::types::{Datatype, VectorIndexConfig, VectorsConfig};
+    use crate::operations::vector_params_builder::VectorParamsBuilder;
+
+    fn collection_params(vectors: VectorsConfig) -> CollectionParams {
+        CollectionParams {
+            vectors,
+            shard_number: NonZeroU32::new(1).unwrap(),
+            sharding_method: None,
+            replication_factor: NonZeroU32::new(1).unwrap(),
+            write_consistency_factor: NonZeroU32::new(1).unwrap(),
+            read_fan_out_factor: None,
+            read_fan_out_delay_ms: None,
+            on_disk_payload: true,
+            sparse_vectors: None,
+        }
+    }
+
+    #[test]
+    fn test_build_segment_optimizer_config_passes_explicit_mirage_config() {
+        let mirage_config = MirageConfig {
+            m: 32,
+            ef_construct: 1024,
+            ..Default::default()
+        };
+        let vector_params = VectorParamsBuilder::new(128, Distance::Euclid)
+            .with_datatype(Datatype::Float32)
+            .with_index(VectorIndexConfig::Mirage(mirage_config))
+            .build();
+        let collection_params = collection_params(VectorsConfig::from(vector_params));
+
+        let optimizer_config =
+            build_segment_optimizer_config(&collection_params, &HnswConfig::default(), &None);
+        let dense_vector = optimizer_config
+            .dense_vector
+            .get(DEFAULT_VECTOR_NAME)
+            .unwrap();
+
+        assert_eq!(dense_vector.mirage_config, Some(mirage_config));
+        assert!(matches!(
+            optimizer_config
+                .plain_dense_vector_config
+                .get(DEFAULT_VECTOR_NAME)
+                .unwrap()
+                .index,
+            Indexes::Plain {}
+        ));
+    }
 }

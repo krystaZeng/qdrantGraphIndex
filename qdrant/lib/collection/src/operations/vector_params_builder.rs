@@ -3,7 +3,7 @@ use std::num::NonZeroU64;
 use segment::types::{Distance, MultiVectorConfig, QuantizationConfig};
 
 use crate::operations::config_diff::HnswConfigDiff;
-use crate::operations::types::{Datatype, VectorParams};
+use crate::operations::types::{Datatype, VectorIndexConfig, VectorParams};
 
 pub struct VectorParamsBuilder {
     vector_params: VectorParams,
@@ -16,6 +16,7 @@ impl VectorParamsBuilder {
                 size: NonZeroU64::new(size).unwrap(),
                 distance,
                 hnsw_config: None,
+                index: None,
                 quantization_config: None,
                 on_disk: None,
                 datatype: None,
@@ -26,6 +27,11 @@ impl VectorParamsBuilder {
 
     pub fn with_hnsw_config(mut self, hnsw_config: HnswConfigDiff) -> Self {
         self.vector_params.hnsw_config = Some(hnsw_config);
+        self
+    }
+
+    pub fn with_index(mut self, index: VectorIndexConfig) -> Self {
+        self.vector_params.index = Some(index);
         self
     }
 

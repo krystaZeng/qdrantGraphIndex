@@ -1,4 +1,5 @@
 use std::backtrace::Backtrace;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error as _;
 use std::fmt::{Debug, Write as _};
@@ -25,8 +26,8 @@ use segment::data_types::groups::GroupId;
 use segment::data_types::modifier::Modifier;
 use segment::data_types::vectors::{DEFAULT_VECTOR_NAME, DenseVector};
 use segment::types::{
-    Distance, Filter, HnswConfig, MultiVectorConfig, Payload, PayloadIndexInfo, PayloadKeyType,
-    PointIdType, QuantizationConfig, SearchParams, SeqNumberType, ShardKey,
+    Distance, Filter, HnswConfig, MirageConfig, MultiVectorConfig, Payload, PayloadIndexInfo,
+    PayloadKeyType, PointIdType, QuantizationConfig, SearchParams, SeqNumberType, ShardKey,
     SparseVectorStorageType, StrictModeConfigOutput, VectorName, VectorNameBuf,
     VectorStorageDatatype, WithPayloadInterface, WithVector,
 };
@@ -1412,6 +1413,26 @@ impl From<Datatype> for VectorStorageDatatype {
     }
 }
 
+/// Explicit dense vector index backend configuration.
+///
+/// P0 exposes Mirage only. HNSW keeps using the legacy `hnsw_config` field to
+/// avoid changing the existing public API shape in the same step.
+#[derive(Debug, Hash, Deserialize, Serialize, JsonSchema, Anonymize, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+#[serde(tag = "type", content = "options")]
+#[anonymize(false)]
+pub enum VectorIndexConfig {
+    Mirage(MirageConfig),
+}
+
+impl Validate for VectorIndexConfig {
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        match self {
+            VectorIndexConfig::Mirage(config) => config.validate(),
+        }
+    }
+}
+
 /// Params of single vector data storage
 #[derive(
     Debug, Hash, Deserialize, Serialize, JsonSchema, Validate, Anonymize, Clone, PartialEq, Eq,
@@ -1428,6 +1449,10 @@ pub struct VectorParams {
     #[serde(default, skip_serializing_if = "is_hnsw_diff_empty")]
     #[validate(nested)]
     pub hnsw_config: Option<HnswConfigDiff>,
+    /// Explicit vector index backend. If none, the legacy HNSW configuration path is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[validate(nested)]
+    pub index: Option<VectorIndexConfig>,
     /// Custom params for quantization. If none - values from collection configuration are used.
     #[serde(
         default,
@@ -1467,6 +1492,91 @@ pub fn validate_nonzerou64_range_min_1_max_65536(
 /// Is considered empty if `None` or if diff has no field specified
 fn is_hnsw_diff_empty(hnsw_config: &Option<HnswConfigDiff>) -> bool {
     hnsw_config.is_none() || *hnsw_config == Some(HnswConfigDiff::default())
+}
+
+fn mirage_vector_index_validation_error(message: &'static str) -> ValidationError {
+    let mut error = ValidationError::new("mirage_p0_unsupported");
+    error.message = Some(Cow::from(message));
+    error
+}
+
+fn validate_vector_index_config(params: &VectorParams) -> Result<(), ValidationErrors> {
+    let Some(VectorIndexConfig::Mirage(mirage_config)) = params.index.as_ref() else {
+        return Ok(());
+    };
+
+    let mut errors = ValidationErrors::new();
+
+    if params.hnsw_config.is_some() {
+        errors.add(
+            "hnsw_config",
+            mirage_vector_index_validation_error(
+                "`index.type = mirage` cannot be combined with legacy `hnsw_config`. Use `index.options` for Mirage parameters.",
+            ),
+        );
+    }
+
+    if params.distance != Distance::Euclid {
+        errors.add(
+            "distance",
+            mirage_vector_index_validation_error("Mirage P0 supports Euclid distance only"),
+        );
+    }
+
+    if params
+        .datatype
+        .is_some_and(|datatype| datatype != Datatype::Float32)
+    {
+        errors.add(
+            "datatype",
+            mirage_vector_index_validation_error("Mirage P0 supports Float32 vector storage only"),
+        );
+    }
+
+    if params.quantization_config.is_some() {
+        errors.add(
+            "quantization_config",
+            mirage_vector_index_validation_error("Mirage P0 does not support quantization"),
+        );
+    }
+
+    if params.multivector_config.is_some() {
+        errors.add(
+            "multivector_config",
+            mirage_vector_index_validation_error("Mirage P0 does not support multivector"),
+        );
+    }
+
+    if params.on_disk == Some(true) {
+        errors.add(
+            "on_disk",
+            mirage_vector_index_validation_error(
+                "Mirage P0 does not support on-disk vector storage",
+            ),
+        );
+    }
+
+    if mirage_config.on_disk == Some(true) {
+        errors.add(
+            "index",
+            mirage_vector_index_validation_error("Mirage P0 does not support on-disk Mirage index"),
+        );
+    }
+
+    if mirage_config.payload_m.is_some() {
+        errors.add(
+            "index",
+            mirage_vector_index_validation_error(
+                "Mirage P0 does not support payload-aware subgraphs",
+            ),
+        );
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
 }
 
 /// Params of single sparse vector data storage
@@ -1698,13 +1808,103 @@ impl Validate for VectorsConfig {
         match self {
             VectorsConfig::Single(single) => single.validate(),
             VectorsConfig::Multi(multi) => common::validation::validate_iter(multi.values()),
+        }?;
+
+        for (_, params) in self.params_iter() {
+            validate_vector_index_config(params)?;
         }
+
+        Ok(())
     }
 }
 
 impl From<VectorParams> for VectorsConfig {
     fn from(params: VectorParams) -> Self {
         VectorsConfig::Single(params)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::operations::config_diff::HnswConfigDiff;
+    use serde_json::json;
+
+    fn mirage_vector_params() -> VectorParams {
+        serde_json::from_value(json!({
+            "size": 128,
+            "distance": "Euclid",
+            "datatype": "float32",
+            "index": {
+                "type": "mirage",
+                "options": {
+                    "m": 16,
+                    "ef_construct": 1024,
+                    "s": 16,
+                    "r": 4,
+                    "iter": 15,
+                    "num_reverse_edges": 96,
+                    "full_scan_threshold": 10000,
+                    "max_indexing_threads": 0,
+                    "on_disk": false
+                }
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn test_vector_params_deserializes_mirage_index_config() {
+        let params = mirage_vector_params();
+
+        assert!(matches!(
+            params.index,
+            Some(VectorIndexConfig::Mirage(config))
+                if config.m == 16
+                    && config.ef_construct == 1024
+                    && config.s == 16
+                    && config.r == 4
+                    && config.iter == 15
+                    && config.num_reverse_edges == 96
+                    && config.on_disk == Some(false)
+        ));
+        VectorsConfig::from(params).validate().unwrap();
+    }
+
+    #[test]
+    fn test_mirage_index_config_rejects_legacy_hnsw_config() {
+        let mut params = mirage_vector_params();
+        params.hnsw_config = Some(HnswConfigDiff {
+            m: Some(16),
+            ..Default::default()
+        });
+
+        let err = VectorsConfig::from(params).validate().unwrap_err();
+        assert!(format!("{err:?}").contains("hnsw_config"));
+    }
+
+    #[test]
+    fn test_mirage_index_config_rejects_non_euclid_distance() {
+        let mut params = mirage_vector_params();
+        params.distance = Distance::Cosine;
+
+        let err = VectorsConfig::from(params).validate().unwrap_err();
+        assert!(format!("{err:?}").contains("distance"));
+    }
+
+    #[test]
+    fn test_mirage_index_config_rejects_on_disk_storage_and_index() {
+        let mut params = mirage_vector_params();
+        params.on_disk = Some(true);
+        params.index = Some(VectorIndexConfig::Mirage(MirageConfig {
+            on_disk: Some(true),
+            ..Default::default()
+        }));
+
+        let err = VectorsConfig::from(params).validate().unwrap_err();
+        let err = format!("{err:?}");
+        assert!(err.contains("on_disk"));
+        assert!(err.contains("index"));
     }
 }
 
@@ -1748,6 +1948,7 @@ impl From<&VectorParams> for VectorParamsBase {
             size,
             distance,
             hnsw_config: _,
+            index: _,
             quantization_config: _,
             on_disk: _,
             datatype: _,

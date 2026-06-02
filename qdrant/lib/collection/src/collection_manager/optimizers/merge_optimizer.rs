@@ -60,6 +60,7 @@ mod tests {
                 DenseVectorOptimizerConfig {
                     on_disk: None,
                     hnsw_config: HnswConfig::default(),
+                    mirage_config: None,
                     quantization_config: None,
                 },
             );

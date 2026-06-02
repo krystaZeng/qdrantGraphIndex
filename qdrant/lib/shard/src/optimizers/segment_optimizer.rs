@@ -17,7 +17,7 @@ use segment::segment::Segment;
 use segment::segment_constructor::build_segment;
 use segment::segment_constructor::segment_builder::SegmentBuilder;
 use segment::types::{
-    HnswGlobalConfig, Indexes, MirageConfig, VectorDataConfig, VectorStorageDatatype,
+    Distance, HnswGlobalConfig, Indexes, MirageConfig, VectorDataConfig, VectorStorageDatatype,
     VectorStorageType,
 };
 use uuid::Uuid;
@@ -50,6 +50,10 @@ pub(super) fn mirage_p0_unsupported_reason(
 ) -> Option<&'static str> {
     if config.multivector_config.is_some() {
         return Some("multi-vector is not supported");
+    }
+
+    if config.distance != Distance::Euclid {
+        return Some("non-euclid distance is not supported");
     }
 
     if config.datatype.unwrap_or(VectorStorageDatatype::Float32) != VectorStorageDatatype::Float32 {
@@ -106,6 +110,10 @@ pub(super) fn resolve_desired_dense_index(
         return Indexes::Plain {};
     }
 
+    if let Some(mirage_config) = vector_cfg.mirage_config {
+        return Indexes::Mirage(mirage_config);
+    }
+
     if use_mirage && mirage_p0_unsupported_reason(vector_config, vector_cfg).is_none() {
         Indexes::Mirage(MirageConfig::from_hnsw(vector_cfg.hnsw_config))
     } else {
@@ -118,7 +126,14 @@ pub fn max_num_indexing_threads(segment_optimizer_config: &SegmentOptimizerConfi
     let segment_resolution = segment_optimizer_config
         .dense_vector
         .values()
-        .map(|cfg| get_num_indexing_threads(cfg.hnsw_config.max_indexing_threads))
+        .map(|cfg| {
+            get_num_indexing_threads(
+                cfg.mirage_config
+                    .map_or(cfg.hnsw_config.max_indexing_threads, |config| {
+                        config.max_indexing_threads
+                    }),
+            )
+        })
         .max();
     if let Some(segment_resolution) = segment_resolution {
         segment_resolution
@@ -561,7 +576,7 @@ mod tests {
     fn vector_config() -> VectorDataConfig {
         VectorDataConfig {
             size: 4,
-            distance: Distance::Dot,
+            distance: Distance::Euclid,
             storage_type: VectorStorageType::Memory,
             index: Indexes::Plain {},
             quantization_config: None,
@@ -574,6 +589,7 @@ mod tests {
         DenseVectorOptimizerConfig {
             on_disk: None,
             hnsw_config: HnswConfig::default(),
+            mirage_config: None,
             quantization_config: None,
         }
     }
@@ -607,6 +623,18 @@ mod tests {
         assert_eq!(
             mirage_p0_unsupported_reason(&config, &vector_cfg),
             Some("multi-vector is not supported"),
+        );
+    }
+
+    #[test]
+    fn test_mirage_p0_rejects_non_euclid_distance() {
+        let mut config = vector_config();
+        let vector_cfg = dense_vector_config();
+        config.distance = Distance::Dot;
+
+        assert_eq!(
+            mirage_p0_unsupported_reason(&config, &vector_cfg),
+            Some("non-euclid distance is not supported"),
         );
     }
 
@@ -670,11 +698,27 @@ mod tests {
     #[test]
     fn test_resolve_desired_dense_index_returns_plain_below_indexing_threshold() {
         let config = vector_config();
-        let vector_cfg = dense_vector_config();
+        let mut vector_cfg = dense_vector_config();
+        vector_cfg.mirage_config = Some(MirageConfig::default());
 
         let index = resolve_desired_dense_index(&config, &vector_cfg, false, true);
 
         assert!(matches!(index, Indexes::Plain {}));
+    }
+
+    #[test]
+    fn test_resolve_desired_dense_index_uses_explicit_mirage_without_env_flag() {
+        let config = vector_config();
+        let mut vector_cfg = dense_vector_config();
+        let explicit_mirage = MirageConfig {
+            m: 32,
+            ..Default::default()
+        };
+        vector_cfg.mirage_config = Some(explicit_mirage);
+
+        let index = resolve_desired_dense_index(&config, &vector_cfg, true, false);
+
+        assert!(matches!(index, Indexes::Mirage(mirage) if mirage == explicit_mirage));
     }
 
     #[test]

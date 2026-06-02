@@ -9,6 +9,9 @@
 
 pub mod config;
 pub(crate) mod faiss_random;
+#[cfg(test)]
+#[path = "tests/golden.rs"]
+pub(crate) mod golden;
 pub mod mirage;
 pub mod refinement_builder;
 

@@ -5,9 +5,9 @@ use segment::common::BYTES_IN_KB;
 use segment::data_types::modifier::Modifier;
 use segment::index::sparse_index::sparse_index_config::{SparseIndexConfig, SparseIndexType};
 use segment::types::{
-    Distance, HnswConfig, Indexes, MultiVectorConfig, PayloadStorageType, QuantizationConfig,
-    SegmentConfig, SparseVectorDataConfig, SparseVectorStorageType, VectorDataConfig,
-    VectorNameBuf, VectorStorageDatatype, VectorStorageType,
+    Distance, HnswConfig, Indexes, MirageConfig, MultiVectorConfig, PayloadStorageType,
+    QuantizationConfig, SegmentConfig, SparseVectorDataConfig, SparseVectorStorageType,
+    VectorDataConfig, VectorNameBuf, VectorStorageDatatype, VectorStorageType,
 };
 
 pub const TEMP_SEGMENTS_PATH: &str = "temp_segments";
@@ -21,6 +21,7 @@ pub const DEFAULT_VACUUM_MIN_VECTOR_NUMBER: usize = 1000;
 pub struct DenseVectorOptimizerConfig {
     pub on_disk: Option<bool>,
     pub hnsw_config: HnswConfig,
+    pub mirage_config: Option<MirageConfig>,
     pub quantization_config: Option<QuantizationConfig>,
 }
 
@@ -67,6 +68,7 @@ impl SegmentOptimizerConfig {
                 distance,
                 on_disk,
                 hnsw_config,
+                mirage_config,
                 quantization_config,
                 multivector_config,
                 datatype,
@@ -90,6 +92,7 @@ impl SegmentOptimizerConfig {
                 DenseVectorOptimizerConfig {
                     on_disk,
                     hnsw_config,
+                    mirage_config,
                     quantization_config,
                 },
             );
@@ -136,6 +139,7 @@ pub struct DenseVectorOptimizerInput {
     pub distance: Distance,
     pub on_disk: Option<bool>,
     pub hnsw_config: HnswConfig,
+    pub mirage_config: Option<MirageConfig>,
     pub quantization_config: Option<QuantizationConfig>,
     pub multivector_config: Option<MultiVectorConfig>,
     pub datatype: Option<VectorStorageDatatype>,

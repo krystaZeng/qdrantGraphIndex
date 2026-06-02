@@ -138,6 +138,7 @@ impl ConfigMismatchOptimizer {
                             default_vector_cfg = DenseVectorOptimizerConfig {
                                 on_disk: None,
                                 hnsw_config: self.global_hnsw_config,
+                                mirage_config: None,
                                 quantization_config: None,
                             };
                             &default_vector_cfg

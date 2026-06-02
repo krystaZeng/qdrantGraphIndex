@@ -658,12 +658,14 @@ fn add_reverse_edges(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
 
     use crate::common::operation_error::OperationError;
+    use crate::index::mirage_index::golden::{generate_vectors, load_cpp_golden_n64_d8_l2};
     use rand::SeedableRng;
     use rand::rngs::StdRng;
     use rayon::ThreadPoolBuilder;
@@ -887,6 +889,77 @@ mod tests {
             non_empty > N * 9 / 10,
             "expected most alive points to have neighbors, got {non_empty}/{N}",
         );
+    }
+
+    #[test]
+    fn test_layer0_refinement_matches_cpp_golden() {
+        struct FixtureScorer<'a> {
+            vectors: &'a [Vec<f32>],
+        }
+
+        impl PairScorer for FixtureScorer<'_> {
+            fn score_pair(&mut self, a: PointOffsetType, b: PointOffsetType) -> ScoreType {
+                -self.vectors[a as usize]
+                    .iter()
+                    .zip(&self.vectors[b as usize])
+                    .map(|(left, right)| {
+                        let diff = left - right;
+                        diff * diff
+                    })
+                    .sum::<ScoreType>()
+            }
+        }
+
+        let fixture = load_cpp_golden_n64_d8_l2();
+        let vectors = generate_vectors(&fixture);
+        let pool = ThreadPoolBuilder::new()
+            .num_threads(fixture.params.threads)
+            .build()
+            .unwrap();
+        let stopped = AtomicBool::new(false);
+        let params = RefinementParams {
+            s: fixture.params.s,
+            r: fixture.params.r,
+            iter: fixture.params.iter,
+            num_reverse_edges: fixture.params.num_reverse_edges,
+            seed: fixture.params.mirage_seed,
+        };
+
+        let layer0 = build_layer0(
+            fixture.n,
+            &params,
+            &pool,
+            |_| true,
+            || Ok(FixtureScorer { vectors: &vectors }),
+            &stopped,
+        )
+        .expect("MIRAGE layer0 golden build should succeed");
+
+        let actual: Vec<Vec<usize>> = layer0
+            .iter()
+            .map(|neighbors| {
+                neighbors
+                    .iter()
+                    .map(|neighbor| neighbor.idx as usize)
+                    .collect()
+            })
+            .collect();
+
+        // The authoritative C++ final_graph order can differ for candidates
+        // with equivalent refinement priority. The semantic contract for
+        // Layer 0 parity is the out-neighbor set; the final injected HNSW
+        // neighbor order is checked separately against the C++ hierarchy dump.
+        let actual_sets: Vec<BTreeSet<usize>> = actual
+            .iter()
+            .map(|neighbors| neighbors.iter().copied().collect())
+            .collect();
+        let expected_sets: Vec<BTreeSet<usize>> = fixture
+            .layer0
+            .iter()
+            .map(|neighbors| neighbors.iter().copied().collect())
+            .collect();
+
+        assert_eq!(actual_sets, expected_sets);
     }
 
     #[test]

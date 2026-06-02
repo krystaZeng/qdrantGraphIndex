@@ -739,6 +739,7 @@ impl TryFrom<api::grpc::qdrant::VectorParams> for VectorParams {
             })?,
             distance: from_grpc_dist(distance)?,
             hnsw_config: hnsw_config.map(Into::into),
+            index: None,
             quantization_config: quantization_config
                 .map(grpc_to_segment_quantization_config)
                 .transpose()?,
@@ -1400,6 +1401,7 @@ impl From<VectorParams> for api::grpc::qdrant::VectorParams {
             size,
             distance,
             hnsw_config,
+            index: _,
             quantization_config,
             on_disk,
             datatype,

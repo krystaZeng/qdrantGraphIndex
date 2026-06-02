@@ -96,6 +96,10 @@ pub(crate) fn faiss_shuffle<T>(values: &mut [T], rng: &mut FaissMt19937) {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use crate::index::mirage_index::golden::load_cpp_golden_n64_d8_l2;
+
     use super::*;
 
     #[test]
@@ -121,5 +125,41 @@ mod tests {
         faiss_shuffle(&mut values, &mut rng);
 
         assert_eq!(values, [3, 4, 1, 2, 5, 7, 6, 0]);
+    }
+
+    #[test]
+    fn test_faiss_random_levels_match_cpp_golden() {
+        let fixture = load_cpp_golden_n64_d8_l2();
+        let mut rng = FaissMt19937::new(fixture.params.hnsw_level_seed);
+
+        let levels: Vec<usize> = (0..fixture.n)
+            .map(|_| faiss_random_level(fixture.params.hnsw_m, &mut rng))
+            .collect();
+
+        assert_eq!(levels, fixture.levels_zero_based);
+    }
+
+    #[test]
+    fn test_faiss_upper_bucket_shuffle_matches_cpp_golden() {
+        let fixture = load_cpp_golden_n64_d8_l2();
+        let mut buckets: Vec<Vec<usize>> = vec![Vec::new()];
+
+        for (pid, level) in fixture.levels_zero_based.iter().copied().enumerate() {
+            if buckets.len() <= level {
+                buckets.resize_with(level + 1, Vec::new);
+            }
+            buckets[level].push(pid);
+        }
+
+        let mut rng = FaissMt19937::new(fixture.params.shuffle_seed);
+        let mut actual_order = BTreeMap::new();
+
+        for level in (1..buckets.len()).rev() {
+            let bucket = &mut buckets[level];
+            faiss_shuffle(bucket, &mut rng);
+            actual_order.insert(level, bucket.clone());
+        }
+
+        assert_eq!(actual_order, fixture.upper_insert_order_by_level);
     }
 }

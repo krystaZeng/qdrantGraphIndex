@@ -910,7 +910,27 @@ impl VectorIndex for MirageIndex {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    use common::budget::ResourcePermit;
+    use common::counter::hardware_counter::HardwareCounterCell;
+    use common::flags::FeatureFlags;
+    use common::progress_tracker::ProgressTracker;
+    use rand::SeedableRng;
+    use rand::prelude::StdRng;
+    use tempfile::Builder;
+
     use super::*;
+    use crate::data_types::vectors::only_default_vector;
+    use crate::entry::entry_point::SegmentEntry;
+    use crate::index::hnsw_index::graph_layers::{GraphLayers, GraphLayersBase};
+    use crate::index::mirage_index::golden::{
+        assert_stats_match, compute_layer0_stats, generate_vectors, load_cpp_golden_n64_d8_l2,
+    };
+    use crate::segment_constructor::VectorIndexBuildArgs;
+    use crate::segment_constructor::simple_segment_constructor::build_simple_segment;
+    use crate::types::{Distance, HnswGlobalConfig, SeqNumberType};
 
     fn expect_validation_error(result: OperationResult<()>, expected: &str) {
         let err = result.unwrap_err();
@@ -955,5 +975,96 @@ mod tests {
             MirageIndex::validate_p0_search(Some(&filter)),
             "Mirage P0 supports no-filter search only",
         );
+    }
+
+    #[test]
+    fn test_persisted_graph_layers_layer0_matches_cpp_injection_golden() {
+        let fixture = load_cpp_golden_n64_d8_l2();
+        let vectors = generate_vectors(&fixture);
+        let stopped = AtomicBool::new(false);
+        let segment_dir = Builder::new()
+            .prefix("mirage_golden_segment")
+            .tempdir()
+            .unwrap();
+        let mirage_dir = Builder::new()
+            .prefix("mirage_golden_index")
+            .tempdir()
+            .unwrap();
+        let hw_counter = HardwareCounterCell::new();
+        let mut segment =
+            build_simple_segment(segment_dir.path(), fixture.dim, Distance::Euclid).unwrap();
+
+        for (point_id, vector) in vectors.iter().enumerate() {
+            segment
+                .upsert_point(
+                    point_id as SeqNumberType,
+                    (point_id as u64).into(),
+                    only_default_vector(vector),
+                    &hw_counter,
+                )
+                .unwrap();
+        }
+
+        let mut build_rng = StdRng::seed_from_u64(7);
+        let mirage_config = MirageConfig {
+            m: fixture.params.hnsw_m,
+            ef_construct: 1024,
+            s: fixture.params.s,
+            r: fixture.params.r,
+            iter: fixture.params.iter,
+            num_reverse_edges: fixture.params.num_reverse_edges,
+            full_scan_threshold: 1,
+            max_indexing_threads: fixture.params.threads,
+            on_disk: Some(false),
+            payload_m: None,
+        };
+
+        let index = MirageIndex::build(
+            MirageIndexOpenArgs {
+                path: mirage_dir.path(),
+                id_tracker: segment.id_tracker.clone(),
+                vector_storage: segment.vector_data
+                    [crate::data_types::vectors::DEFAULT_VECTOR_NAME]
+                    .vector_storage
+                    .clone(),
+                quantized_vectors: segment.vector_data
+                    [crate::data_types::vectors::DEFAULT_VECTOR_NAME]
+                    .quantized_vectors
+                    .clone(),
+                payload_index: segment.payload_index.clone(),
+                mirage_config,
+            },
+            VectorIndexBuildArgs {
+                permit: Arc::new(ResourcePermit::dummy(1)),
+                old_indices: &[],
+                gpu_device: None,
+                rng: &mut build_rng,
+                stopped: &stopped,
+                hnsw_global_config: &HnswGlobalConfig::default(),
+                feature_flags: FeatureFlags::default(),
+                progress: ProgressTracker::new_for_test(),
+            },
+        )
+        .unwrap();
+        assert_eq!(index.indexed_vector_count(), fixture.n);
+        drop(index);
+
+        let graph = GraphLayers::load(mirage_dir.path(), false, false).unwrap();
+        let mut actual_graph = Vec::with_capacity(fixture.n);
+
+        for point_id in 0..fixture.n {
+            let mut links = Vec::new();
+            graph.for_each_link(point_id as PointOffsetType, 0, |link| {
+                links.push(link as usize)
+            });
+            let actual_links: std::collections::BTreeSet<_> = links.iter().copied().collect();
+            let expected_links: std::collections::BTreeSet<_> =
+                fixture.layer0_injected[point_id].iter().copied().collect();
+            assert_eq!(actual_links, expected_links);
+            actual_graph.push(links);
+        }
+
+        let actual_stats = compute_layer0_stats(&actual_graph);
+        assert_stats_match(&actual_stats, &fixture.layer0_injected_stats);
     }
 }

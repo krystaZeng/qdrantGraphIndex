@@ -571,6 +571,18 @@ impl GraphLayersBuilder {
         layer0.fill_from_sorted_with_heuristic(candidates, self.hnsw_m.m0, score);
     }
 
+    #[cfg(test)]
+    pub(crate) fn raw_links_for_test(
+        &self,
+        point_id: PointOffsetType,
+        level: usize,
+    ) -> Vec<PointOffsetType> {
+        self.links_layers[point_id as usize][level]
+            .read()
+            .links()
+            .to_vec()
+    }
+
     /// Add a new point using pre-existing links.
     /// Mutually exclusive with [`Self::link_new_point`].
     pub fn add_new_point(
@@ -712,6 +724,10 @@ mod tests {
     use crate::fixtures::index_fixtures::{TestRawScorerProducer, random_vector};
     use crate::index::hnsw_index::graph_links::{GraphLinksFormat, normalize_links};
     use crate::index::hnsw_index::tests::create_graph_layer_fixture;
+    use crate::index::mirage_index::golden::{
+        assert_stats_match, compute_layer0_stats, generate_vectors, l2_score,
+        load_cpp_golden_n64_d8_l2, scored_top_s_candidates,
+    };
     use crate::types::Distance;
     use crate::vector_storage::{DEFAULT_STOPPED, VectorStorage as _};
 
@@ -759,6 +775,42 @@ mod tests {
                 .is_none(),
             "mark-ready-only points must not be registered as extra entry points",
         );
+    }
+
+    #[test]
+    fn test_graph_layers_builder_layer0_injection_matches_cpp_golden() {
+        let fixture = load_cpp_golden_n64_d8_l2();
+        let vectors = generate_vectors(&fixture);
+        let builder = GraphLayersBuilder::new(
+            fixture.n,
+            HnswM::new(fixture.params.hnsw_m, fixture.params.hnsw_m0),
+            1024,
+            1,
+            true,
+        );
+        let mut actual_graph = Vec::with_capacity(fixture.n);
+
+        for point_id in 0..fixture.n {
+            let candidates = scored_top_s_candidates(&fixture, &vectors, point_id);
+
+            builder.inject_layer0_with_heuristic(
+                point_id as PointOffsetType,
+                candidates.into_iter(),
+                |a, b| l2_score(&vectors, a as usize, b as usize),
+            );
+
+            let actual: Vec<usize> = builder
+                .raw_links_for_test(point_id as PointOffsetType, 0)
+                .into_iter()
+                .map(|idx| idx as usize)
+                .collect();
+
+            assert_eq!(actual, fixture.layer0_injected[point_id]);
+            actual_graph.push(actual);
+        }
+
+        let actual_stats = compute_layer0_stats(&actual_graph);
+        assert_stats_match(&actual_stats, &fixture.layer0_injected_stats);
     }
 
     #[cfg(not(windows))]
